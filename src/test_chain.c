@@ -126,7 +126,7 @@ int chain_selftest(void) {
 
     // ── §4 attribution round-trip on a real signed tx (COMMIT carrier) ───────
     uint8_t prev[32]; memset(prev, 0x11, 32);
-    uint8_t commit0[36]; int vl = 0; uint8_t pre[4] = { 0xFF, 0x50, 0x4E, SM_OP_COMMIT };
+    uint8_t commit0[36]; int vl = 0; uint8_t pre[4] = { 0xFF, 0x44, 0x4E, SM_OP_COMMIT };
     memcpy(commit0, pre, 4); vl = 4; memset(commit0 + vl, 0x22, 32); vl += 32;
     uint8_t tx[1024]; int txl;
     CK(build_tx(priv, pub, h160, commit0, vl, 0, NULL, 0, prev, 0, tx, &txl), "build signed COMMIT tx");
@@ -143,14 +143,14 @@ int chain_selftest(void) {
     uint8_t commitment[32]; sha256_1(cm_in, ci, commitment);
 
     // block @ height 2: COMMIT (opcode 0x01)
-    uint8_t commit[40]; int cl = 0; uint8_t cpre[4] = { 0xFF, 0x50, 0x4E, SM_OP_COMMIT }; memcpy(commit, cpre, 4); cl = 4; memcpy(commit + cl, commitment, 32); cl += 32;
+    uint8_t commit[40]; int cl = 0; uint8_t cpre[4] = { 0xFF, 0x44, 0x4E, SM_OP_COMMIT }; memcpy(commit, cpre, 4); cl = 4; memcpy(commit + cl, commitment, 32); cl += 32;
     uint8_t txc[1024]; int txcl; build_tx(priv, pub, h160, commit, cl, 0, NULL, 0, prev, 1, txc, &txcl);
     uint8_t blk2[2048]; int blk2l; build_block(txc, txcl, 1000, blk2, &blk2l);
     IdxBlockMeta m2; sm_begin_block(s, 2, 1000, 1);        // mtp=1000, rate=1 (floor)
     CK(idx_parse_block(blk2, (size_t)blk2l, &m2, fold_cb, &fc), "parse+fold COMMIT block");
 
     // block @ height 3: CLAIM (commit is now 1 block deep; opcode 0x02)
-    uint8_t claim[80]; int kl = 0; uint8_t kpre[4] = { 0xFF, 0x50, 0x4E, SM_OP_CLAIM }; memcpy(claim, kpre, 4); kl = 4; memcpy(claim + kl, salt, 32); kl += 32; memcpy(claim + kl, name, nlen); kl += nlen;
+    uint8_t claim[80]; int kl = 0; uint8_t kpre[4] = { 0xFF, 0x44, 0x4E, SM_OP_CLAIM }; memcpy(claim, kpre, 4); kl = 4; memcpy(claim + kl, salt, 32); kl += 32; memcpy(claim + kl, name, nlen); kl += nlen;
     uint8_t prev2[32]; memset(prev2, 0x33, 32);
     uint8_t txk[1024]; int txkl; build_tx(priv, pub, h160, claim, kl, 1, NULL, 0, prev2, 0, txk, &txkl); // value=1 → 28d at floor rate
     uint8_t blk3[2048]; int blk3l; build_block(txk, txkl, 2000, blk3, &blk3l);
@@ -289,7 +289,7 @@ int mempool_selftest(void) {
     uint8_t pub[33]; secp_pubkey(priv, pub);
     uint8_t h160[20]; hash160(pub, 33, h160);
     uint8_t payh[20]; memset(payh, 0x55, 20);
-    uint8_t commit[36]; { uint8_t pre[4] = { 0xFF, 0x50, 0x4E, SM_OP_COMMIT }; memcpy(commit, pre, 4); memset(commit + 4, 0x22, 32); }
+    uint8_t commit[36]; { uint8_t pre[4] = { 0xFF, 0x44, 0x4E, SM_OP_COMMIT }; memcpy(commit, pre, 4); memset(commit + 4, 0x22, 32); }
     char why[128];
 
     // valid tx: OP_RETURN carrier (value 0) + a P2PKH payment ≥ dust
@@ -391,11 +391,11 @@ int chain_mkblocks(const char *dir) {
     uint8_t commitment[32]; sha256_1(cm_in, ci, commitment);
     uint8_t prev[32]; memset(prev, 0x11, 32);
 
-    uint8_t commit[40]; int cl = 0; uint8_t cpre[4] = { 0xFF, 0x50, 0x4E, SM_OP_COMMIT }; memcpy(commit, cpre, 4); cl = 4; memcpy(commit + cl, commitment, 32); cl += 32;
+    uint8_t commit[40]; int cl = 0; uint8_t cpre[4] = { 0xFF, 0x44, 0x4E, SM_OP_COMMIT }; memcpy(commit, cpre, 4); cl = 4; memcpy(commit + cl, commitment, 32); cl += 32;
     uint8_t txc[1024]; int txcl; build_tx(priv, pub, h160, commit, cl, 0, NULL, 0, prev, 1, txc, &txcl);
     uint8_t blk0[2048]; int blk0l; build_block(txc, txcl, 1000, blk0, &blk0l);
 
-    uint8_t claim[80]; int kl = 0; uint8_t kpre[4] = { 0xFF, 0x50, 0x4E, SM_OP_CLAIM }; memcpy(claim, kpre, 4); kl = 4; memcpy(claim + kl, salt, 32); kl += 32; memcpy(claim + kl, name, nlen); kl += nlen;
+    uint8_t claim[80]; int kl = 0; uint8_t kpre[4] = { 0xFF, 0x44, 0x4E, SM_OP_CLAIM }; memcpy(claim, kpre, 4); kl = 4; memcpy(claim + kl, salt, 32); kl += 32; memcpy(claim + kl, name, nlen); kl += nlen;
     uint8_t prev2[32]; memset(prev2, 0x33, 32);
     uint8_t txk[1024]; int txkl; build_tx(priv, pub, h160, claim, kl, 1, NULL, 0, prev2, 0, txk, &txkl);
     uint8_t blk1[2048]; int blk1l; build_block(txk, txkl, 2000, blk1, &blk1l);

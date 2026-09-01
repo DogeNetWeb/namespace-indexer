@@ -272,7 +272,7 @@ static void codec_scripts_init(void) {
     int l = 0; p1(g_p2pkh, &l, 0x76); p1(g_p2pkh, &l, 0xA9); p1(g_p2pkh, &l, 0x14); p(g_p2pkh, &l, h, 20); p1(g_p2pkh, &l, 0x88); p1(g_p2pkh, &l, 0xAC);
     l = 0; p1(g_p2sh, &l, 0xA9); p1(g_p2sh, &l, 0x14); p(g_p2sh, &l, h, 20); p1(g_p2sh, &l, 0x87);
     l = 0; p1(g_opret, &l, 0x6A); p1(g_opret, &l, 36);
-    { uint8_t a[36] = { 0xFF, 0x50, 0x4E, 0x01 }; memset(a + 4, 0x22, 32); p(g_opret, &l, a, 36); }
+    { uint8_t a[36] = { 0xFF, 0x44, 0x4E, 0x01 }; memset(a + 4, 0x22, 32); p(g_opret, &l, a, 36); }
     memset(g_prev1, 0xD1, 36); g_prev1[35] = 0x00;
     memset(g_prev2, 0xD2, 36); g_prev2[35] = 0x00;
     for (int i = 0; i < 4; i++) { g_ss1[i] = g_push; g_ssn1[i] = 2; }

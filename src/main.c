@@ -1,4 +1,4 @@
-// PepeNet headless indexer — CLI entry.
+// DogeNet headless indexer — CLI entry.
 //
 // The state machine is the protocol-sm fold (../../protocol-sm/impls/c), linked
 // as the consensus engine. This binary adds the chain side the reference omits:
@@ -35,8 +35,8 @@ static int cmd_selftest(void) {
     uint8_t in[32], st[32];
     sm_generate(42, 2000, 0, in, st, NULL, NULL, NULL);
     // Goldens = protocol/impls/c `./sm random 42 2000` (the stream embeds the
-    // 0xFF 'P' 'N' universal prefix, so any prefix skew between this link and
-    // the reference forks input_digest immediately).
+    // 0xFF 'D' 'N' universal prefix; fuzz-mode input_digest sees the raw bytes,
+    // random-mode hashes decoded fields so this golden is prefix-stable).
     EXPECT(eqhex(in, "1b8e794802636a0bf6da528755eabe566ae20ef04eba7dcd2b71db3ce9b738d0"),
            "sm_generate(42,2000) input_digest matches reference");
     EXPECT(eqhex(st, "0bba34a7ab905a6bc403ce33fe28b1054bd6182ae14e0f7bcd7ff957756ea2ad"),

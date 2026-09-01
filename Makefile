@@ -1,4 +1,4 @@
-# PepeNet headless indexer (C reference)
+# DogeNet headless indexer (C reference)
 #
 # Links the protocol reference fold (protocol/impls/c/src, a pinned submodule of
 # namespace-protocol) as its consensus engine — compile-in-place, so the daemon

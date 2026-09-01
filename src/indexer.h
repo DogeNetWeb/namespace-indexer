@@ -18,10 +18,10 @@ extern "C" {
 // serve loop's mesh gate, and the dial pool's bucket all match on it. One
 // mark per NETWORK: every node on a deployment must agree or they can't
 // find each other. Overridable at build time so a branded deployment flies
-// its own flag (the PepeNet desktop builds with "/pepenet-"); the generic
-// default stays "/pepenet-".
+// its own flag (the DogeNet desktop builds with "/dogenet-"); the generic
+// default stays "/dogenet-".
 #ifndef IDX_DNET_MARK
-#define IDX_DNET_MARK "/pepenet-"
+#define IDX_DNET_MARK "/dogenet-"
 #endif
 
 // Peers-table bounds (idx_db_peers_prune): an addr unseen this long ages out,
@@ -48,10 +48,10 @@ extern volatile int idx_sync_stop;
 // hosts use it to render truthful sync state. The headless CLI just logs it.
 extern volatile int64_t idx_sync_peer_height;
 
-// The user-agent (subver) sent in our version message. A "/pepenet-…/" prefix
+// The user-agent (subver) sent in our version message. A "/dogenet-…/" prefix
 // is the mesh's discovery mark (peer-discovery design): crawlers classify a
 // node as dns-aware by this string, so embedding hosts set their app identity
-// here BEFORE the first sync pass (e.g. "/pepenet-desktop:0.1/").
+// here BEFORE the first sync pass (e.g. "/dogenet-desktop:0.1/").
 extern const char *idx_sync_agent;
 
 // The connected peer's subver and services, captured at the current pass's
@@ -90,7 +90,7 @@ typedef struct {
     char     peer[80];      // remote ip:port ("" until connected)
     char     host[80];      // outbound: the dial target host
     uint16_t rport;         // outbound: the dial target port
-    char     agent[128];    // peer subver ("/pepenet-" = a mesh peer)
+    char     agent[128];    // peer subver ("/dogenet-" = a mesh peer)
     int      connected;     // socket open
     int      up;            // version handshake complete
     int      outbound;      // dialed by us (else accepted inbound)
@@ -116,7 +116,7 @@ int idx_serve_peer_held(const char *target);
 // of timer latency.
 extern volatile int64_t idx_serve_stage_seq;
 
-// Live crawl progress (the chain-graph walk that hunts "/pepenet-" peers —
+// Live crawl progress (the chain-graph walk that hunts "/dogenet-" peers —
 // idx_crawl's per-pass counters, which otherwise only reach stderr). Updated
 // as the pass dials; same seqlock scheme, readable from any thread.
 typedef struct {
@@ -124,8 +124,8 @@ typedef struct {
     int     dials;          // this pass: dial attempts so far
     int     max_dials;      // this pass: the bound
     int     up;             // this pass: completed handshakes
-    int     hits;           // this pass: "/pepenet-" agents found
-    int     known;          // "/pepenet-" peers known in the db at last pass end
+    int     hits;           // this pass: "/dogenet-" agents found
+    int     known;          // "/dogenet-" peers known in the db at last pass end
     int64_t last_pass;      // wall time the last pass finished (0 = never ran)
     int64_t passes;         // completed passes since process start
     char    last_peer[80];  // most recent addr probed
@@ -136,7 +136,7 @@ void idx_crawl_status(IdxCrawlStatus *out);
 // Mesh hooks (peer-discovery slice 3, step 3): an embedder (the desktop / a
 // pepenet daemon) drives a carrier over the pepenet peer connections idx_serve
 // manages, so the DNS mesh rides the chain wire — no separate mesh port. A peer
-// whose version subver starts "/pepenet-" is a mesh peer; on its handshake
+// whose version subver starts "/dogenet-" is a mesh peer; on its handshake
 // idx_serve calls peer_up with a `send` bound to that connection (send a dn*
 // command) and routes inbound "dn<name>" commands to peer_msg. NULL = the node
 // serves chain data only (no gossip), which is all the standalone indexer does
@@ -156,7 +156,7 @@ typedef struct {
 // The chain-wire presence (peer-discovery slice 3). Listen on `port` (0 =
 // dial-only, no bind — for a NAT'd node), maintain outbound connections to
 // `dial_peers` (comma host:port list, may be NULL), version-handshake
-// advertising our "/pepenet-" agent, answer getaddr, harvest addr, serve
+// advertising our "/dogenet-" agent, answer getaddr, harvest addr, serve
 // getheaders/getdata and getblocks-within-the-window (a near-tip peer can
 // sync wholly from us; a deep-behind one gets honest silence and its ladder's
 // NODE_NETWORK gate routes it to an archive peer), and — when `mesh` is

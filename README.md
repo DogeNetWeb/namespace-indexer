@@ -70,13 +70,13 @@ make test       # engine-link + shim conformance + end-to-end chain pipeline
 # Sync from a Dogecoin-family node (confirmation-only). regtest example:
 ./indexerd sync regtest names.db 127.0.0.1
 
-# Pepecoin mainnet: the profile pins ACTIVATION_HEIGHT 1,130,000 and bootstraps
-# from the checkpoint at height 1,119,000 (11,000 blocks earlier), so the §3.4
-# FEE_WINDOW (10,081) is FULL from block 1,129,082 — every rate the fold
-# computes is a full-window rate. Peers: a host[:port]
-# list, or
-# "auto" for peer-cache + DNS seeds. (A trailing activation only seeds a FRESH
-# db; a stored value always wins.)
+# Dogecoin mainnet (DogeNet): ACTIVATION_HEIGHT 6,359,500 (2026-09-03 17:00 UTC
+# target), checkpoint 6,348,500 (11,000 earlier) so FEE_WINDOW is full from
+# 6,358,582. Prefix 0xFF 'D' 'N'. Peers: host[:port] list, or "auto" for
+# peer-cache + DNS seeds. (A trailing activation only seeds a FRESH db.)
+./indexerd sync doge doge.db auto
+
+# Pepecoin mainnet remains a second profile (activation 1,130,000).
 ./indexerd sync pep pep.db auto
 
 # Offline: fold raw block files (hex or binary) at a given activation height
@@ -119,7 +119,7 @@ carrier blocks) under the current engine rules — no network round trip.
 
 ## Status
 
-Fully working against Pepecoin mainnet: offline `index` + queries + projection;
+Fully working against Dogecoin-family mainnet (Pepecoin proven; DogeNet pins doge 6,359,500): offline `index` + queries + projection;
 live-validated P2P `sync` (AuxPoW, SPV-grade PoW validation, checkpoint-anchored);
 reorg replay from persisted carrier blocks (byte-identical refold, asserted in
 `selftest`); the write path and the full §3 market surface (COMMIT→CLAIM,

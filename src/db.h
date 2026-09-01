@@ -40,7 +40,7 @@ void idx_db_flag_set(sqlite3 *db, const char *k);
 // best = sync/broadcast candidates — proven peers first, then harvested
 // NODE_NETWORK addrs by recency; crawl = the exploration frontier (never-tried
 // first, then stalest); agent = addrs whose subver starts with `prefix`
-// ("/pepenet-" = the dns-mesh bucket), freshest handshake first.
+// ("/dogenet-" = the dns-mesh bucket), freshest handshake first.
 void idx_db_peer_note(sqlite3 *db, const char *addr, int64_t services, int64_t now);
 void idx_db_peer_seen(sqlite3 *db, const char *addr, int64_t services,
                       const char *agent, int64_t now);

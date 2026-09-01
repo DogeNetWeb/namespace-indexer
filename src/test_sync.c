@@ -192,7 +192,7 @@ static void make_chain_files(const char *dir) {
     // h2: a CARRIER block (a §1 COMMIT) that ALSO pays the wallet. Pre-fix this
     // is the only one of the two wallet blocks the substrate kept — which is
     // exactly why the replay could resurrect its output.
-    uint8_t commit[36] = { 0xFF, 0x50, 0x4E, SM_OP_COMMIT };
+    uint8_t commit[36] = { 0xFF, 0x44, 0x4E, SM_OP_COMMIT };
     memset(commit + 4, 0x22, 32);
     uint8_t prevc[32]; memset(prevc, 0x11, 32);
     if (!build_carrier_tx(priv, pub, signer, commit, 36, g_wallet, (uint64_t)FUND_VALUE,

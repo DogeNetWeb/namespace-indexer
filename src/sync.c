@@ -30,7 +30,7 @@
 #include <time.h>
 
 // subver classifier: does this agent carry the overlay discovery mark?
-// (IDX_DNET_MARK, indexer.h — build-time per deployment, "/pepenet-" default)
+// (IDX_DNET_MARK, indexer.h — build-time per deployment, "/dogenet-" default)
 #define AGENT_MARKED(a) (!strncmp((a), IDX_DNET_MARK, sizeof IDX_DNET_MARK - 1))
 
 // ── coin params (host-chain profile — see docs/notes/host-profiles.md) ────────
@@ -56,13 +56,17 @@ typedef struct {
 } Coin;
 #define SUBSIDY_10K  (10000LL * SM_KOINU_PER_DOGE)
 static const Coin COINS[] = {
-    { "doge",    { 0xC0, 0xC0, 0xC0, 0xC0 }, 22556, 0, 6264000,  // checkpoint re-pinned near tip
-      // (block 6,264,000 = edd25ca2…fdb6, 2026-06-25) for a live-rate reading; activation
-      // passed on the CLI (= start + FEE_WINDOW + 1). Internal (little-endian) byte order.
-      { 0xb6, 0xfd, 0xb0, 0xe4, 0xb9, 0x79, 0xe2, 0x88, 0x01, 0x7a, 0x39, 0x8a, 0x2c, 0x5f, 0xca, 0xc8,
-        0x53, 0x53, 0x3e, 0x93, 0xd5, 0xa3, 0xc9, 0xe4, 0x7a, 0x05, 0x37, 0x07, 0xa2, 0x5c, 0xd2, 0xed }, SUBSIDY_10K,
+    // Dogecoin mainnet (DogeNet). Names activate at block 6,359,500 (target
+    // wall-clock 2026-09-03 17:00 UTC / noon US Central; Wednesday re-check
+    // may snap to the nearest 500, keeping the 11,000 gap). Prefix 0xFF 'D' 'N'.
+    // Fold checkpoint (start) is 6,348,500 (header a6fe57ea…4766ac, 2026-08-26)
+    // — 11,000 below activation so the §3.4 oracle window (FEE_WINDOW 10,081,
+    // fed from start+1) is FULL from block 6,358,582. Internal (LE) byte order.
+    { "doge",    { 0xC0, 0xC0, 0xC0, 0xC0 }, 22556, 6359500, 6348500,
+      { 0xac, 0x66, 0x47, 0xde, 0xa8, 0xe8, 0x2e, 0x52, 0xc5, 0xc9, 0x61, 0x93, 0xa9, 0xda, 0x2d, 0xb5,
+        0x26, 0x2a, 0xd5, 0x2f, 0x50, 0xc3, 0x9d, 0xa5, 0xbc, 0xc2, 0xd1, 0xfb, 0xea, 0x57, 0xfe, 0xa6 }, SUBSIDY_10K,
       { "seed.multidoge.org", "seed2.multidoge.org", NULL },
-      0x1e0fffff, 0x62, 0x1a00969d, 1782425940, 1782425922 },
+      0x1e0fffff, 0x62, 0x196e146b, 1787776823, 1787776796 },
     // Pepecoin mainnet (Dogecoin 1.14 fork; same 1-min blocks + flat 10k tail subsidy).
     // Names activate at block 1,130,000 (re-pinned 2026-07-20 for the 0xFF 'P' 'N'
     // prefix relaunch); the fold checkpoint (start) is pinned at 1,119,000 (header
@@ -600,7 +604,7 @@ static int p2p_handshake(int fd, const uint8_t magic[4], int64_t our_height) {
     uint64_t sn = self_nonce();                                      // nonce (self-connect guard)
     for (int i = 0; i < 8; i++) v[o++] = (uint8_t)(sn >> (8*i));
     size_t ual = strlen(idx_sync_agent); if (ual > 100) ual = 100;   // user-agent: the
-    v[o++] = (uint8_t)ual;                                           // "/pepenet-…/" subver is
+    v[o++] = (uint8_t)ual;                                           // "/dogenet-…/" subver is
     memcpy(v + o, idx_sync_agent, ual); o += (int)ual;               // the mesh's discovery mark
     for (int i = 0; i < 4; i++) v[o++] = (our_height >> (8*i)) & 0xff; // start_height
     v[o++] = 1;                                                      // relay: we accept tx invs (mempool)
@@ -1367,7 +1371,7 @@ invalid_peer:
 
 // ── serve: the inbound chain-wire presence (discovery slice 3, step 1) ────────
 // A pepenet node is a first-class chain peer: it listens on the chain port,
-// does the version handshake advertising our "/pepenet-" agent (so a crawler
+// does the version handshake advertising our "/dogenet-" agent (so a crawler
 // classifies it), answers getaddr from the peer table, harvests inbound addr,
 // and ponds pings. This is what makes a node reachable + discoverable — it
 // CLOSES the discovery loop (a crawl now finds a real dns-aware node). Chain
@@ -1421,7 +1425,7 @@ typedef struct {
     time_t last_rx;                   // last byte received (liveness clock)
     time_t last_ping;                 // last ping we originated (idle probe)
     time_t last_pull;                 // last mesh getblocks we sent (tip pull)
-    char agent[128];                  // peer subver ("/pepenet-" ⇒ a mesh peer)
+    char agent[128];                  // peer subver ("/dogenet-" ⇒ a mesh peer)
     int64_t peer_h;                   // peer's claimed start_height at handshake (0 unknown)
     void *mesh_handle;                // embedder's per-peer handle (NULL till peer_up)
     int  dn_asked;                    // we sent this pepenet peer a dngetaddr already
@@ -1610,7 +1614,7 @@ static void serve_send_dnaddr(SConn *c, const Coin *coin, sqlite3 *db,
 // addr gossip: core nodes never getaddr their INBOUND peers, so answering
 // getaddr with self can't reach a node we dialed. Announce → the peer's
 // addrman stores + relays it → another node's crawl harvests it → dials our
-// chain port → reads the "/pepenet-" subver → the mesh finds itself. Gated
+// chain port → reads the "/dogenet-" subver → the mesh finds itself. Gated
 // on listening (port) + a learned external ip (version.addr_recv); actually
 // REACHING the announced port is still the operator's port-forward.
 static void serve_announce_self(const SConn *c, const Coin *coin,
@@ -1635,7 +1639,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
             if (a && a != 127 && a != 10)
                 snprintf(self, 80, "%u.%u.%u.%u:%u", pl[40], pl[41], pl[42], pl[43], port);
         }
-        // capture the peer's subver (agent) — "/pepenet-" marks a mesh peer —
+        // capture the peer's subver (agent) — "/dogenet-" marks a mesh peer —
         // and its claimed start_height (the varstr's tail), the serve plane's
         // own network-tip signal (idx_serve_best_height)
         { uint64_t off = 4+8+8+26+26+8, ua;

@@ -28,7 +28,7 @@ static const char *SCHEMA =
     // chain peers harvested from addr gossip: sync-failover pool + crawl frontier.
     // last_good = last completed handshake by US (0 = only ever heard of);
     // last_try = last dial attempt (crawl politeness); agent = subver captured at
-    // the last good handshake ("/pepenet-…" = dns-aware, the mesh bucket).
+    // the last good handshake ("/dogenet-…" = dns-aware, the mesh bucket).
     // dnet = 1 when some pepenet peer vouched for this addr over dnaddr (an
     // overlay-discovery hint we can act on BEFORE our own handshake confirms the
     // agent — this is what lets the dns mesh find itself on the host chain).
