@@ -44,7 +44,7 @@ typedef struct {
     const char *name; uint8_t magic[4]; uint16_t port; int64_t activation;
     int64_t start; uint8_t start_hash[32];
     int64_t subsidy;         // §3.4 flat-tail subsidy (koinu/block); consensus-critical per host
-    const char *seeds[3];    // the host chain's own DNS seeds (Core's vSeeds hosts),
+    const char *seeds[4];    // the host chain's own DNS seeds (Core's vSeeds hosts),
                              // NULL-terminated — the last-resort sync candidates
     // PoW validation profile (pow.h): powlimit == 0 skips validation entirely
     // (test profiles sync synthetic fixture chains). start_bits/start_time/
@@ -56,17 +56,17 @@ typedef struct {
 } Coin;
 #define SUBSIDY_10K  (10000LL * SM_KOINU_PER_DOGE)
 static const Coin COINS[] = {
-    // Dogecoin mainnet (DogeNet). Names activate at block 6,359,500 (target
-    // wall-clock 2026-09-03 17:00 UTC / noon US Central; Wednesday re-check
-    // may snap to the nearest 500, keeping the 11,000 gap). Prefix 0xFF 'D' 'N'.
-    // Fold checkpoint (start) is 6,348,500 (header a6fe57ea…4766ac, 2026-08-26)
+    // Dogecoin mainnet (DogeNet). Names activate at block 6,429,500 (target
+    // wall-clock 2026-10-25 ~04:40 UTC; re-pinned 2026-10-24 for live
+    // testing, keeping the 11,000 gap). Prefix 0xFF 'D' 'N'.
+    // Fold checkpoint (start) is 6,418,500 (header baebf7e7…df7ad1, 2026-10-17)
     // — 11,000 below activation so the §3.4 oracle window (FEE_WINDOW 10,081,
-    // fed from start+1) is FULL from block 6,358,582. Internal (LE) byte order.
-    { "doge",    { 0xC0, 0xC0, 0xC0, 0xC0 }, 22556, 6359500, 6348500,
-      { 0xac, 0x66, 0x47, 0xde, 0xa8, 0xe8, 0x2e, 0x52, 0xc5, 0xc9, 0x61, 0x93, 0xa9, 0xda, 0x2d, 0xb5,
-        0x26, 0x2a, 0xd5, 0x2f, 0x50, 0xc3, 0x9d, 0xa5, 0xbc, 0xc2, 0xd1, 0xfb, 0xea, 0x57, 0xfe, 0xa6 }, SUBSIDY_10K,
-      { "seed.multidoge.org", "seed2.multidoge.org", NULL },
-      0x1e0fffff, 0x62, 0x196e146b, 1787776823, 1787776796 },
+    // fed from start+1) is FULL from block 6,428,582. Internal (LE) byte order.
+    { "doge",    { 0xC0, 0xC0, 0xC0, 0xC0 }, 22556, 6429500, 6418500,
+      { 0xd1, 0x7a, 0xdf, 0xfc, 0xa8, 0x67, 0x30, 0x68, 0xbf, 0xbc, 0x7d, 0x95, 0x36, 0x9c, 0xec, 0x17,
+        0x1c, 0x12, 0x3f, 0xa4, 0xe6, 0xf0, 0x42, 0xa6, 0x6a, 0xe4, 0x7d, 0x5b, 0xe7, 0xf7, 0xeb, 0xba }, SUBSIDY_10K,
+      { "seed.dogecoin.surf", "seed.multidoge.org", "seed2.multidoge.org", NULL },
+      0x1e0fffff, 0x62, 0x19547b37, 1792213564, 1792213486 },
     // Pepecoin mainnet (Dogecoin 1.14 fork; same 1-min blocks + flat 10k tail subsidy).
     // Names activate at block 1,130,000 (re-pinned 2026-07-20 for the 0xFF 'P' 'N'
     // prefix relaunch); the fold checkpoint (start) is pinned at 1,119,000 (header

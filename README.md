@@ -70,9 +70,9 @@ make test       # engine-link + shim conformance + end-to-end chain pipeline
 # Sync from a Dogecoin-family node (confirmation-only). regtest example:
 ./indexerd sync regtest names.db 127.0.0.1
 
-# Dogecoin mainnet (DogeNet): ACTIVATION_HEIGHT 6,359,500 (2026-09-03 17:00 UTC
-# target), checkpoint 6,348,500 (11,000 earlier) so FEE_WINDOW is full from
-# 6,358,582. Prefix 0xFF 'D' 'N'. Peers: host[:port] list, or "auto" for
+# Dogecoin mainnet (DogeNet): ACTIVATION_HEIGHT 6,429,500 (2026-10-25 ~04:40 UTC
+# target), checkpoint 6,418,500 (11,000 earlier) so FEE_WINDOW is full from
+# 6,428,582. Prefix 0xFF 'D' 'N'. Peers: host[:port] list, or "auto" for
 # peer-cache + DNS seeds. (A trailing activation only seeds a FRESH db.)
 ./indexerd sync doge doge.db auto
 
@@ -119,7 +119,7 @@ carrier blocks) under the current engine rules — no network round trip.
 
 ## Status
 
-Fully working against Dogecoin-family mainnet (Pepecoin proven; DogeNet pins doge 6,359,500): offline `index` + queries + projection;
+Fully working against Dogecoin-family mainnet (Pepecoin proven; DogeNet pins doge 6,429,500): offline `index` + queries + projection;
 live-validated P2P `sync` (AuxPoW, SPV-grade PoW validation, checkpoint-anchored);
 reorg replay from persisted carrier blocks (byte-identical refold, asserted in
 `selftest`); the write path and the full §3 market surface (COMMIT→CLAIM,
