@@ -105,6 +105,19 @@ int64_t idx_db_projected_height(sqlite3 *db);   // height the last projection re
 // fresh sm_new(activation); fields are loaded verbatim. Returns rows loaded.
 int  idx_db_load_state(sqlite3 *db, SmState *s);
 
+// Rollback checkpoints — local replay shortcut, never digested or sent. A row is
+// the projected fold state at a height; idx_db_project takes one every
+// idx_db_ckpt_every() heights (meta rb_ckpt_every; 0 = off) and keeps the last 4.
+// ckpt_load restores the newest valid row <= max_height whose activation matches
+// s->activation_height into *s (a fresh sm_new); it returns that height, or -1.
+int64_t idx_db_ckpt_every(sqlite3 *db);
+void    idx_db_ckpt_set_every(sqlite3 *db, int64_t every);
+int     idx_db_ckpt_save(sqlite3 *db, SmState *s);
+int64_t idx_db_ckpt_load(sqlite3 *db, int64_t max_height, SmState *s);
+int     idx_db_ckpt_prune_above(sqlite3 *db, int64_t height);
+int     idx_db_ckpt_wipe(sqlite3 *db);
+int     idx_db_ckpt_count(sqlite3 *db);
+
 // ── epochs projection (ownership history — substrate for overlay layers) ─
 // An append-only per-block record of every ownership CHANGE: (name, start_height,
 // owner) rows, owner NULL = the name lapsed/left the state at that height. Written

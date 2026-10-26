@@ -206,23 +206,38 @@ static int rollback_replay_cb(void *u, int64_t height, const uint8_t *raw, size_
 // the last one), so a reorg could leave a node diverged from a fresh sync of the
 // winning branch. Rules, digests and formats are unchanged.
 // Replaces *s (old state freed). Returns 1, 0 on failure.
-int idx_sync_rollback(SmState **s, sqlite3 *db, OracleFeed *oracle,
-                      int64_t activation, int64_t to_height) {
+//
+// use_ckpt: start from the newest valid rollback checkpoint <= to_height
+// (idx_db_ckpt_*; local-only, digest-verified) instead of activation.
+static int rollback_replay_exact(SmState **s, sqlite3 *db, OracleFeed *oracle,
+                                 int64_t activation, int64_t to_height, int use_ckpt) {
     idx_db_block_prune_above(db, to_height);
+    if (!idx_db_ckpt_prune_above(db, to_height)) return 0;
     oracle_rollback(oracle, to_height + 1);
     sm_free(*s);
     *s = sm_new((uint64_t)activation);
+    int64_t base = use_ckpt ? idx_db_ckpt_load(db, to_height, *s) : -1;
+    if (base < 0) base = INT64_MIN;
     FoldCtx fc = { .s = *s, .db = db, .oracle = oracle };
     fold_load_watch(&fc);
     sqlite3_stmt *st = NULL;
+    int64_t ring[11]; int nr = 0, ok = 1;
+    if (base != INT64_MIN) {                 // MTP ring = the 11 blocks-row times <= base
+        if (sqlite3_prepare_v2(db, "SELECT time FROM (SELECT height,time FROM blocks WHERE height<=?1"
+                                   " AND time IS NOT NULL ORDER BY height DESC LIMIT 11) ORDER BY height",
+                               -1, &st, NULL) != SQLITE_OK) return 0;
+        sqlite3_bind_int64(st, 1, base);
+        while (sqlite3_step(st) == SQLITE_ROW) ring[nr++] = sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st); st = NULL;
+    }
     // raw rows without a blocks row are still replayed (ordered merge via UNION)
     if (sqlite3_prepare_v2(db,
-            "SELECT u.h, b.time, r.raw FROM (SELECT height AS h FROM blocks WHERE height<=?1"
-            " UNION SELECT height FROM raw_blocks WHERE height<=?1) u"
+            "SELECT u.h, b.time, r.raw FROM (SELECT height AS h FROM blocks WHERE height<=?1 AND height>?2"
+            " UNION SELECT height FROM raw_blocks WHERE height<=?1 AND height>?2) u"
             " LEFT JOIN blocks b ON b.height=u.h LEFT JOIN raw_blocks r ON r.height=u.h ORDER BY u.h",
             -1, &st, NULL) != SQLITE_OK) return 0;
     sqlite3_bind_int64(st, 1, to_height);
-    int64_t ring[11]; int nr = 0, ok = 1;
+    sqlite3_bind_int64(st, 2, base);
     while (ok && sqlite3_step(st) == SQLITE_ROW) {
         int64_t h = sqlite3_column_int64(st, 0);
         if (sqlite3_column_type(st, 2) != SQLITE_NULL) {
@@ -244,8 +259,39 @@ int idx_sync_rollback(SmState **s, sqlite3 *db, OracleFeed *oracle,
     // The replayed state stands at to_height — stamp the cursor so the projection
     // records that.
     (*s)->cur_height = to_height;
-    idx_db_project(db, *s);
-    return 1;
+    return idx_db_project(db, *s);
+}
+
+// Test-only fault hook: called inside the rollback transaction just before
+// COMMIT. NULL in every production path.
+void (*idx_sync_rollback_test_hook)(sqlite3 *db, int64_t to_height) = NULL;
+// The prune (blocks/raw_blocks/epochs/utxos/checkpoints above to_height), the
+// replay's db side effects and the projection + proj_height run in ONE
+// BEGIN IMMEDIATE..COMMIT: a crash or failure anywhere in between leaves the
+// pre-reorg db exactly as it was. oracle_rollback is in-RAM only; on failure
+// the oracle and *s are reloaded from the untouched db, so the caller sees the
+// committed pre-rollback state. Nested in an open transaction it uses a SAVEPOINT.
+int idx_sync_rollback(SmState **s, sqlite3 *db, OracleFeed *oracle,
+                      int64_t activation, int64_t to_height) {
+    int outer = sqlite3_get_autocommit(db) != 0;
+    if (sqlite3_exec(db, outer ? "BEGIN IMMEDIATE" : "SAVEPOINT idx_rollback", NULL, NULL, NULL) != SQLITE_OK)
+        return 0;
+    int ok = rollback_replay_exact(s, db, oracle, activation, to_height, 1);
+    if (ok && idx_sync_rollback_test_hook) idx_sync_rollback_test_hook(db, to_height);
+    if (ok) ok = sqlite3_exec(db, outer ? "COMMIT" : "RELEASE idx_rollback", NULL, NULL, NULL) == SQLITE_OK;
+    if (ok) return 1;
+    if (outer) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    else { sqlite3_exec(db, "ROLLBACK TO idx_rollback", NULL, NULL, NULL); sqlite3_exec(db, "RELEASE idx_rollback", NULL, NULL, NULL); }
+    sm_free(*s);
+    *s = sm_new((uint64_t)activation);
+    if (*s) {
+        idx_db_load_state(db, *s);
+        int64_t ph = idx_db_projected_height(db);
+        if (ph >= 0) (*s)->cur_height = ph;
+    }
+    oracle_rollback(oracle, INT64_MIN);
+    idx_db_oracle_warm(db, oracle);
+    return 0;
 }
 
 // ── file helpers ──────────────────────────────────────────────────────────────
@@ -409,6 +455,7 @@ static int cmd_refold(int argc, char **argv) {
     // edges land exactly, see idx_sync_rollback).
     idx_db_epochs_wipe(db);
     idx_db_epochs_mark(db, 0);
+    idx_db_ckpt_wipe(db);                    // rules may have changed: old states are void
     if (!idx_sync_rollback(&s, db, oracle, activation, height)) {
         fprintf(stderr, "refold failed\n");
         oracle_free(oracle); sm_free(s); idx_db_close(db); return 1;
