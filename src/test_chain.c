@@ -406,3 +406,44 @@ int chain_mkblocks(const char *dir) {
     for (int i = 0; i < 20; i++) printf("%02x", h160[i]); printf(")\n");
     return 0;
 }
+
+// Reorg-rollback fixture (port of PepeNet idx-12/idx-13 tests). Writes
+// <pfx>00.bin..<pfx>47.bin (heights 0..47):
+//   carriers: 0 commit alice, 1 claim alice, 6 commit bob, 21 commit carol
+//   (bob/carol never claimed); every other block carries a plain OP_RETURN that
+//   is NOT a carrier. Times step so alice's lease lapses and both commits pass
+//   COMMIT_EXPIRY on NON-carrier blocks — what a carrier-only replay got wrong.
+//   Blocks above `fork` differ (filler tag, time +7 s): the other branch.
+//   times[48] (optional) receives the block times.
+int chain_mkblocks_expiry_br(const char *dir, char pfx, int fork, int64_t *times) {
+    uint8_t priv[32]; for (int i = 0; i < 32; i++) priv[i] = (uint8_t)(i + 1);
+    uint8_t pub[33]; if (!secp_pubkey(priv, pub)) return 1;
+    uint8_t h160[20]; hash160(pub, 33, h160);
+    uint8_t salt[32]; memset(salt, 0x07, 32);
+    uint32_t t = 1000;
+    for (int h = 0; h < 48; h++) {
+        uint8_t act[80]; int al = 0;
+        const char *cname = h == 0 ? "alice" : h == 6 ? "bob" : h == 21 ? "carol" : NULL;
+        if (cname) {
+            int nl = (int)strlen(cname);
+            uint8_t ci[60]; memcpy(ci, salt, 32); memcpy(ci + 32, cname, (size_t)nl); memcpy(ci + 32 + nl, h160, 20);
+            uint8_t cm[32]; sha256_1(ci, (size_t)(52 + nl), cm);
+            uint8_t pre[4] = { 0xFF, 0x44, 0x4E, SM_OP_COMMIT }; memcpy(act, pre, 4); memcpy(act + 4, cm, 32); al = 36;
+        } else if (h == 1) {
+            uint8_t pre[4] = { 0xFF, 0x44, 0x4E, SM_OP_CLAIM }; memcpy(act, pre, 4); memcpy(act + 4, salt, 32);
+            memcpy(act + 36, "alice", 5); al = 41;
+        } else {
+            memcpy(act, "reorg-filler", 12); act[12] = (uint8_t)h; al = 13;   // not a carrier prefix
+            if (h > fork) { act[13] = (uint8_t)pfx; al = 14; }               // the other branch
+        }
+        uint8_t prev[32]; memset(prev, 0x40 + h, 32);
+        uint8_t tx[1024]; int txl; if (!build_tx(priv, pub, h160, act, al, h == 1 ? 1 : 0, NULL, 0, prev, 0, tx, &txl)) return 1;
+        uint32_t bt = t + (h > fork ? 7u : 0u);
+        if (times) times[h] = bt;
+        uint8_t blk[2048]; int bl; build_block(tx, txl, bt, blk, &bl);
+        char pth[1024]; snprintf(pth, sizeof pth, "%s/%c%02d.bin", dir, pfx, h);
+        if (write_file(pth, blk, bl)) return 1;
+        t += h < 6 ? 1000 : h < 25 ? 4000 : 3500000;   // tail: ~40 d steps > SM_MAX_LEASE overall
+    }
+    return 0;
+}

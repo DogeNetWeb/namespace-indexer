@@ -188,19 +188,23 @@ static int rollback_replay_cb(void *u, int64_t height, const uint8_t *raw, size_
     int folded_before = fc->folded;
     if (!idx_parse_block(raw, len, &meta, tx_cb, fc)) return 0;
     // re-derive epoch rows (height-bounded ⇒ idempotent over what already stands).
-    // Replay walks carrier blocks only, so a lapse between them lands at the NEXT
-    // carrier block's height — after a refold wipe, lapse edges carry that
-    // granularity (the live fold, which sees every block, records them exactly).
+    // (idx_sync_rollback calls begin_block for the non-raw rows in between, so
+    // lapse edges land at the exact live heights.)
     if (fc->db && (fc->folded > folded_before || fc->s->ev[SM_EV_LAPSE] != lapses_before))
         idx_db_epochs_update(fc->db, fc->s, height);
     return 1;
 }
 // Roll the fold back to `to_height` (kept): prune every height-keyed projection
-// above it, drop its oracle rows, and rebuild the state by replaying the stored
-// raw blocks ≤ to_height in order (carrier blocks + wallet-touching blocks) — a
-// byte-identical refold, because the skipped blocks touch no state and their
-// oracle rows (all heights) are already in the feed. The wallet blocks in the
-// substrate re-mark spends the replayed carrier funds would otherwise shed.
+// above it, drop its oracle rows, and rebuild the state from local data with the
+// exact replay (port of PepeNet idx-12/idx-13): every blocks row <= to_height gets
+// the sm_begin_block the live fold gave it (raw rows replay their txs through
+// rollback_replay_cb as before; other rows get begin_block with the MTP of the
+// blocks times — the same rows idx_db_oracle_warm feeds the oracle — from an
+// 11-deep ring; preblock is rate-free). So COMMIT_EXPIRY pruning, lease lapses,
+// lapse epochs and lapse-stamped muts land at the live heights. The old
+// carrier-only replay moved them to the next carrier block (or dropped them after
+// the last one), so a reorg could leave a node diverged from a fresh sync of the
+// winning branch. Rules, digests and formats are unchanged.
 // Replaces *s (old state freed). Returns 1, 0 on failure.
 int idx_sync_rollback(SmState **s, sqlite3 *db, OracleFeed *oracle,
                       int64_t activation, int64_t to_height) {
@@ -210,10 +214,35 @@ int idx_sync_rollback(SmState **s, sqlite3 *db, OracleFeed *oracle,
     *s = sm_new((uint64_t)activation);
     FoldCtx fc = { .s = *s, .db = db, .oracle = oracle };
     fold_load_watch(&fc);
-    if (idx_db_rawblock_iter(db, to_height, rollback_replay_cb, &fc) < 0) return 0;
-    // The replayed state stands at to_height (carrier-less blocks past the last
-    // carrier touch nothing) — stamp the cursor so the projection records that,
-    // not the last carrier's height (or 0 for a carrier-less range).
+    sqlite3_stmt *st = NULL;
+    // raw rows without a blocks row are still replayed (ordered merge via UNION)
+    if (sqlite3_prepare_v2(db,
+            "SELECT u.h, b.time, r.raw FROM (SELECT height AS h FROM blocks WHERE height<=?1"
+            " UNION SELECT height FROM raw_blocks WHERE height<=?1) u"
+            " LEFT JOIN blocks b ON b.height=u.h LEFT JOIN raw_blocks r ON r.height=u.h ORDER BY u.h",
+            -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, to_height);
+    int64_t ring[11]; int nr = 0, ok = 1;
+    while (ok && sqlite3_step(st) == SQLITE_ROW) {
+        int64_t h = sqlite3_column_int64(st, 0);
+        if (sqlite3_column_type(st, 2) != SQLITE_NULL) {
+            ok = rollback_replay_cb(&fc, h, (const uint8_t *)sqlite3_column_blob(st, 2),
+                                    (size_t)sqlite3_column_bytes(st, 2));
+        } else {
+            int64_t mtp = sm_mtp(ring, nr);
+            int64_t lapses_before = (*s)->ev[SM_EV_LAPSE];
+            sm_begin_block(*s, h, mtp, (*s)->cur_rate);   // preblock is rate-free
+            if ((*s)->ev[SM_EV_LAPSE] != lapses_before) idx_db_epochs_update(db, *s, h);
+        }
+        if (sqlite3_column_type(st, 1) != SQLITE_NULL) {   // oracle feed = blocks rows only
+            if (nr == 11) { memmove(ring, ring + 1, 10 * sizeof *ring); nr = 10; }
+            ring[nr++] = sqlite3_column_int64(st, 1);
+        }
+    }
+    sqlite3_finalize(st);
+    if (!ok) return 0;
+    // The replayed state stands at to_height — stamp the cursor so the projection
+    // records that.
     (*s)->cur_height = to_height;
     idx_db_project(db, *s);
     return 1;
@@ -376,8 +405,8 @@ static int cmd_refold(int argc, char **argv) {
     idx_db_oracle_warm(db, oracle); oracle_set_subsidy(oracle, idx_db_get_subsidy(db, SUBSIDY_10K));
     // refold = the rules may have changed: recorded epochs could be wrong under the
     // new fold. Wipe and re-derive the whole history from the raw carrier blocks
-    // (complete coverage — mark from genesis; lapse edges land at carrier-block
-    // granularity, see rollback_replay_cb).
+    // (complete coverage — mark from genesis; every block is re-begun, so lapse
+    // edges land exactly, see idx_sync_rollback).
     idx_db_epochs_wipe(db);
     idx_db_epochs_mark(db, 0);
     if (!idx_sync_rollback(&s, db, oracle, activation, height)) {

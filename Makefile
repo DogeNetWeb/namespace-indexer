@@ -91,6 +91,11 @@ test_sync: $(TEST_SRCS) src/test_sync.c $(SECPLIB)
 test_codec: $(TEST_SRCS) src/test_codec.c $(SECPLIB)
 	$(CC) $(CFLAGS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ $(TEST_SRCS) src/test_codec.c $(LIBS)
 
+# test_reorg: reorg rollback == fresh sync of the winning branch (expiry/lapse
+# crossing, at the expiry, at the lapse, deep).
+test_reorg: $(TEST_SRCS) src/test_reorg.c $(SECPLIB)
+	$(CC) $(CFLAGS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ $(TEST_SRCS) src/test_reorg.c $(LIBS)
+
 # test_serve covers src/serve_store.c — the peer-facing getheaders/getblocks/
 # getdata cache + the blockstage mailbox — which no other suite touches. It
 # needs only serve_store.c and sqlite, so it links its own tiny composition
@@ -98,14 +103,14 @@ test_codec: $(TEST_SRCS) src/test_codec.c $(SECPLIB)
 test_serve: src/test_serve.c src/serve_store.c src/serve_store.h
 	$(CC) $(CFLAGS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ src/test_serve.c src/serve_store.c $(SQLITE_LIBS)
 
-# `make check` = the four suites. Run `make test` for the shipped selftest.
+# `make check` = the five suites. Run `make test` for the shipped selftest.
 # Every suite runs even if an earlier one fails; the target fails if any did.
-check: test_db test_sync test_codec test_serve
-	@rc=0; for t in ./test_db ./test_sync ./test_codec ./test_serve; do \
+check: test_db test_sync test_codec test_serve test_reorg
+	@rc=0; for t in ./test_db ./test_sync ./test_codec ./test_serve ./test_reorg; do \
 	  echo "=== $$t ==="; $$t || rc=1; done; \
 	if [ $$rc -eq 0 ]; then echo "check: ALL PASSED"; else echo "check: FAILED"; fi; exit $$rc
 
 check-clean:
-	rm -f test_db test_sync test_codec test_serve
+	rm -f test_db test_sync test_codec test_serve test_reorg
 
 .PHONY: check check-clean
