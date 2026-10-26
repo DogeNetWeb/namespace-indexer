@@ -108,9 +108,10 @@ test_serve: src/test_serve.c src/serve_store.c src/serve_store.h
 
 # `make check` = the six suites. Run `make test` for the shipped selftest.
 # Every suite runs even if an earlier one fails; the target fails if any did.
-check: test_db test_sync test_codec test_serve test_reorg test_rollback
+check: test_db test_sync test_codec test_serve test_reorg test_rollback indexerd
 	@rc=0; for t in ./test_db ./test_sync ./test_codec ./test_serve ./test_reorg ./test_rollback; do \
 	  echo "=== $$t ==="; $$t || rc=1; done; \
+	echo "=== scripts/test_peer_height.py ==="; python3 scripts/test_peer_height.py ./indexerd || rc=1; \
 	if [ $$rc -eq 0 ]; then echo "check: ALL PASSED"; else echo "check: FAILED"; fi; exit $$rc
 
 check-clean:

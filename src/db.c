@@ -75,6 +75,13 @@ void idx_db_save_sync(sqlite3 *db, int64_t height, const uint8_t tip_hash[32]) {
     char hbuf[32]; snprintf(hbuf, sizeof hbuf, "%lld", (long long)height); meta_set(db, "height", hbuf);
     char hh[65]; tohex(tip_hash, 32, hh); meta_set(db, "tip", hh);
 }
+int64_t idx_db_get_peer_height(sqlite3 *db);
+// announcement evidence: only ever raises the stored value
+void idx_db_raise_peer_height(sqlite3 *db, int64_t h) {
+    if (h <= 0 || h <= idx_db_get_peer_height(db)) return;
+    char b[32]; snprintf(b, sizeof b, "%lld", (long long)h);
+    meta_set(db, "peer_height", b);
+}
 void idx_db_set_peer_height(sqlite3 *db, int64_t h) {
     if (h <= 0) return;
     char b[32]; snprintf(b, sizeof b, "%lld", (long long)h);
