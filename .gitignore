@@ -11,3 +11,4 @@ test_sync
 test_codec
 test_serve
 test_reorg
+test_rollback

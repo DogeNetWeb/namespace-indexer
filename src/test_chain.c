@@ -447,3 +447,52 @@ int chain_mkblocks_expiry_br(const char *dir, char pfx, int fork, int64_t *times
     }
     return 0;
 }
+
+// rollback-txn fixture: heights 0..RB_NBLK-1, files <dir>/<pfx>NN.bin.
+//   0 commit alice · 1 claim alice · 4 commit bob · 5 claim bob ·
+//   12 TRANSFER_NAME alice→T · 22 TRANSFER_NAME bob→T · every other block a
+//   non-carrier filler. Heights > fork form a branch: kind 0 = fillers only
+//   (claims/transfers above the fork REMOVED), kind 1 = same actions but the
+//   transfers go to T' (CHANGED), kind 2 = same actions (only times/fillers differ).
+int chain_mkblocks_rb(const char *dir, char pfx, int fork, int kind, int nblk) {
+    uint8_t priv[32]; for (int i = 0; i < 32; i++) priv[i] = (uint8_t)(i + 1);
+    uint8_t pub[33]; if (!secp_pubkey(priv, pub)) return 1;
+    uint8_t h160[20]; hash160(pub, 33, h160);
+    uint8_t salt[32]; memset(salt, 0x07, 32);
+    static const uint8_t mag[2] = { 0x44, 0x4E };
+    uint32_t t = 1000;
+    for (int h = 0; h < nblk; h++) {
+        int br = h > fork;
+        uint8_t act[80]; int al = 0;
+        const char *cname = h == 0 ? "alice" : h == 4 ? "bob" : NULL;
+        const char *kname = h == 1 ? "alice" : h == 5 ? "bob" : NULL;
+        const char *xname = h == 12 ? "alice" : h == 22 ? "bob" : NULL;
+        if (br && kind == 0) cname = kname = xname = NULL;
+        if (cname) {
+            int nl = (int)strlen(cname);
+            uint8_t ci[60]; memcpy(ci, salt, 32); memcpy(ci + 32, cname, (size_t)nl); memcpy(ci + 32 + nl, h160, 20);
+            uint8_t cm[32]; sha256_1(ci, (size_t)(52 + nl), cm);
+            uint8_t pre[4] = { 0xFF, mag[0], mag[1], SM_OP_COMMIT }; memcpy(act, pre, 4); memcpy(act + 4, cm, 32); al = 36;
+        } else if (kname) {
+            int nl = (int)strlen(kname);
+            uint8_t pre[4] = { 0xFF, mag[0], mag[1], SM_OP_CLAIM }; memcpy(act, pre, 4); memcpy(act + 4, salt, 32);
+            memcpy(act + 36, kname, (size_t)nl); al = 36 + nl;
+        } else if (xname) {
+            int nl = (int)strlen(xname);
+            uint8_t pre[4] = { 0xFF, mag[0], mag[1], SM_OP_TRANSFER_NAME }; memcpy(act, pre, 4);
+            memset(act + 4, (br && kind == 1) ? 0x6B : 0x5A, 20);
+            memcpy(act + 24, xname, (size_t)nl); al = 24 + nl;
+        } else {
+            memcpy(act, "rbtxn-filler", 12); act[12] = (uint8_t)h; al = 13;
+            if (br) { act[13] = (uint8_t)pfx; al = 14; }
+        }
+        uint8_t prev[32]; memset(prev, 0x40 + h, 32); prev[0] = br ? (uint8_t)pfx : 0;
+        uint8_t tx[1024]; int txl;
+        if (!build_tx(priv, pub, h160, act, al, kname ? 1 : 0, NULL, 0, prev, 0, tx, &txl)) return 1;
+        uint8_t blk[2048]; int bl; build_block(tx, txl, t + (br ? 7u : 0u), blk, &bl);
+        char pth[1024]; snprintf(pth, sizeof pth, "%s/%c%02d.bin", dir, pfx, h);
+        if (write_file(pth, blk, bl)) return 1;
+        t += 600;
+    }
+    return 0;
+}
