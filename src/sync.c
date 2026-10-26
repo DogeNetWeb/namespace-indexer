@@ -726,6 +726,30 @@ static int p2p_handshake(int fd, const uint8_t magic[4], int64_t our_height) {
 }
 
 volatile int idx_sync_stop = 0;                 // embedding hosts only (indexer.h)
+static pthread_mutex_t g_ph_mu = PTHREAD_MUTEX_INITIALIZER;
+static int64_t g_ph_best = 0, g_ph_disk = 0, g_ph_at = 0;
+int64_t idx_peer_height_note(sqlite3 *db, int64_t h, int64_t now, int force) {
+    int64_t w = 0, best;
+    pthread_mutex_lock(&g_ph_mu);
+    if (h > g_ph_best) g_ph_best = h;
+    if (db && g_ph_best > g_ph_disk && (force || now - g_ph_at >= IDX_PH_WRITE_MIN_S)) {
+        w = g_ph_best; g_ph_disk = w; g_ph_at = now;
+    }
+    best = g_ph_best;
+    pthread_mutex_unlock(&g_ph_mu);
+    if (w) idx_db_raise_peer_height(db, w);     // monotonic vs the stored value too
+    return best;
+}
+void idx_peer_height_reset(void) {
+    pthread_mutex_lock(&g_ph_mu); g_ph_best = g_ph_disk = g_ph_at = 0; pthread_mutex_unlock(&g_ph_mu);
+}
+// a serve peer announced (or pushed) a block we can place at height h: it has
+// at least that chain. Raise its live claim and the persisted peer_height.
+static void serve_peer_announced(int64_t *ph, sqlite3 *db, int64_t h) {
+    if (h <= 0) return;
+    if (h > *ph) *ph = h;
+    idx_peer_height_note(db, h, (int64_t)time(NULL), 0);
+}
 volatile int idx_self_seed = 0;                 // set when a seed dial loops home (indexer.h)
 volatile int64_t idx_sync_peer_height = 0;      // embedding hosts only (indexer.h)
 const char *idx_sync_agent = IDX_DNET_MARK "indexer:0.1/";   // hosts override (indexer.h)
@@ -1257,7 +1281,10 @@ static int cmd_sync(int argc, char **argv) {
             fprintf(stderr, "  %s:%u handshake failed\n", host, port);
             close(fd); fd = -1; continue;
         }
-        if (idx_sync_peer_height > 0) idx_db_set_peer_height(db, idx_sync_peer_height);
+        if (idx_sync_peer_height > 0) {   // a handshake claim, never below announced evidence
+            int64_t ev = idx_peer_height_note(NULL, 0, 0, 0);
+            idx_db_set_peer_height(db, idx_sync_peer_height > ev ? idx_sync_peer_height : ev);
+        }
         net_peer_str(fd, picked, sizeof picked);
         idx_db_peer_seen(db, picked, (int64_t)idx_sync_peer_services,
                          (const char *)idx_sync_peer_agent, (int64_t)time(NULL));
@@ -1289,7 +1316,10 @@ static int cmd_sync(int argc, char **argv) {
         snprintf(picked, sizeof picked, "%s", fb_picked);
         idx_sync_peer_height = fb_h; idx_sync_peer_services = (uint64_t)fb_svc;
         snprintf((char *)idx_sync_peer_agent, sizeof idx_sync_peer_agent, "%s", fb_agent);
-        if (idx_sync_peer_height > 0) idx_db_set_peer_height(db, idx_sync_peer_height);
+        if (idx_sync_peer_height > 0) {   // a handshake claim, never below announced evidence
+            int64_t ev = idx_peer_height_note(NULL, 0, 0, 0);
+            idx_db_set_peer_height(db, idx_sync_peer_height > ev ? idx_sync_peer_height : ev);
+        }
         fprintf(stderr, "  no archive peer reachable — using limited peer %s\n", picked);
     }
     if (fb_fd >= 0) close(fb_fd);
@@ -1417,6 +1447,9 @@ static int cmd_sync(int argc, char **argv) {
             }
             if (connect_block(&fc, height + 1, pl, pl_len)) {
                 height++;
+                // the sync peer served this block: it is at least this high
+                if (height > idx_sync_peer_height) idx_sync_peer_height = height;
+                idx_peer_height_note(db, height, (int64_t)time(NULL), 0);
                 int64_t hh; idx_db_load_sync(db, &hh, tip);   // refresh tip hash (hh == height)
                 got_any = 1;
             }
@@ -1427,6 +1460,7 @@ static int cmd_sync(int argc, char **argv) {
         else idle++;
     }
     fprintf(stderr, "sync idle — caught up at height %lld\n", (long long)height);
+    idx_peer_height_note(db, idx_sync_peer_height, (int64_t)time(NULL), 1);   // flush the rate-limited write
     if (idx_sync_peer_height > 0 && height >= idx_sync_peer_height)
         s_parity = time(NULL);          // hard parity, measured on a live socket
     idx_db_project(db, s);
@@ -1864,7 +1898,10 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
                 if (mempool_has(h) || mempool_seen(h)) continue;
                 memcpy(want[nreq++], h, 32);
             } else if (type == 2 && nblk < 16 && ss && c->up) {
-                if (serve_store_have(ss, h)) continue;         // headers or stage: known
+                if (serve_store_have(ss, h)) {                 // headers or stage: known
+                    serve_peer_announced(&c->peer_h, db, serve_store_locate(ss, h, 1));
+                    continue;
+                }
                 memcpy(wblk[nblk++], h, 32);
             }
         }
@@ -1882,8 +1919,31 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         // from a hostile peer costs bounded disk and zero state.
         if (!ss || pln < 80) return;
         uint8_t bh[32]; idx_sha256d(pl, 80, bh);
+        { int64_t ph = serve_store_locate(ss, pl + 4, 1);       // prev on our chain → its height + 1
+          if (ph >= 0) serve_peer_announced(&c->peer_h, db, ph + 1); }
         if (serve_store_stage_put(ss, bh, pl + 4, pl, pln, (int64_t)time(NULL)))
             idx_serve_stage_seq++;               // embedding hosts: fold-on-inv nudge
+    } else if (!strcmp(cmd, "headers")) {
+        // a header announcement (BIP130 peers). Only headers already on our
+        // chain count (their height is known and their work was checked when
+        // they folded) — an unverified run above our tip proves nothing.
+        // Doge headers since AuxPoW carry a variable-length proof, so parsing
+        // stops at the first AuxPoW header (the inv path covers those).
+        if (!ss || pln < 1) return;
+        uint32_t o = 0; uint64_t cnt = pl[o++];
+        if (cnt == 0xFD) { if (pln < 3) return; cnt = pl[o] | (pl[o+1] << 8); o += 2; }
+        else if (cnt >= 0xFE) return;
+        if (cnt == 0 || cnt > 2000) return;
+        int64_t best = -1;
+        for (uint64_t i = 0; i < cnt && o + 81 <= pln; i++, o += 81) {
+            uint32_t ver = pl[o] | (pl[o+1]<<8) | (pl[o+2]<<16) | ((uint32_t)pl[o+3]<<24);
+            uint8_t hh[32]; idx_sha256d(pl + o, 80, hh);
+            int64_t hgt = serve_store_locate(ss, hh, 1);
+            if (hgt < 0) { int64_t pv = serve_store_locate(ss, pl + o + 4, 1); if (pv >= 0) hgt = pv + 1; }
+            if (hgt > best) best = hgt;
+            if (ver & 0x100) break;                        // AuxPoW follows: stride unknown
+        }
+        if (best > 0) serve_peer_announced(&c->peer_h, db, best);
     } else if (!strcmp(cmd, "tx")) {
         // validate + pool + relay. On accept, announce (inv type 1) to every other
         // live peer — the receiver's own has/seen guard breaks the echo loop.
@@ -2450,6 +2510,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
     for (int i = 0; i < SERVE_MAX_CONN; i++) if (conns[i].fd >= 0) serve_drop(&conns[i], mesh);
     if (lfd >= 0) close(lfd);
     g_conns.seq++; g_conns.n = 0; g_conns.seq++;      // serve is down — clear the page
+    idx_peer_height_note(db, 0, (int64_t)time(NULL), 1);   // flush a rate-limited peer_height
     serve_store_close(ss); idx_db_close(db);
     return 0;
 }

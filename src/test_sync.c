@@ -607,6 +607,37 @@ static void sec_rewalk(const char *dir) {
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
+// peer_height from announcements: monotonic in memory and on disk, the meta
+// write rate-limited to one per IDX_PH_WRITE_MIN_S, force flushes, and a
+// handshake write may lower the stored value but announcements never do.
+static void sec_peer_height(const char *dir) {
+    printf("\n-- peer_height follows announcements --\n");
+    char p[700]; snprintf(p, sizeof p, "%s/ph.db", dir);
+    sqlite3 *db = idx_db_open(p);
+    if (!db) { CHECK(0, "open ph.db"); return; }
+    idx_peer_height_reset();
+    int64_t t = 1000000;
+    CHECK(idx_peer_height_note(db, 100, t, 0) == 100 && idx_db_get_peer_height(db) == 100, "first announcement written at once");
+    CHECK(idx_peer_height_note(db, 150, t + 1, 0) == 150 && idx_db_get_peer_height(db) == 100, "second within the window: memory only (rate-limited)");
+    CHECK(idx_peer_height_note(db, 120, t + 2, 0) == 150, "a lower announcement never lowers the best");
+    CHECK(idx_peer_height_note(db, 151, t + IDX_PH_WRITE_MIN_S - 1, 0) == 151 && idx_db_get_peer_height(db) == 100, "still inside the window: no write");
+    idx_peer_height_note(db, 0, t + IDX_PH_WRITE_MIN_S, 0);
+    CHECK(idx_db_get_peer_height(db) == 151, "window elapsed: best written");
+    idx_peer_height_note(db, 160, t + IDX_PH_WRITE_MIN_S + 1, 1);
+    CHECK(idx_db_get_peer_height(db) == 160, "force flushes inside the window");
+    int writes = 0; int64_t last = idx_db_get_peer_height(db);
+    for (int i = 0; i < 1000; i++) {           // a block every second for ~16 min
+        idx_peer_height_note(db, 161 + i, t + 200 + i, 0);
+        int64_t now = idx_db_get_peer_height(db); if (now != last) { writes++; last = now; }
+    }
+    CHECK(writes <= 1000 / IDX_PH_WRITE_MIN_S + 1 && writes >= 1000 / IDX_PH_WRITE_MIN_S - 1, "1000 announcements → ~1 write per window");
+    idx_db_set_peer_height(db, 5000);
+    idx_db_raise_peer_height(db, 4000);
+    CHECK(idx_db_get_peer_height(db) == 5000, "raise never lowers the stored value");
+    idx_db_close(db); idx_peer_height_reset();
+    unlink(p);
+}
+
 int main(void) {
     char dir[] = "/tmp/idx_test_sync_XXXXXX";
     if (!mkdtemp(dir)) { fprintf(stderr, "mkdtemp failed\n"); return 1; }
@@ -618,6 +649,7 @@ int main(void) {
     sec_seam(dir);
     sec_bounds(dir);
     sec_rewalk(dir);
+    sec_peer_height(dir);
 
     // teardown
     for (int i = 0; i < NBLK; i++) unlink(g_blk[i]);
