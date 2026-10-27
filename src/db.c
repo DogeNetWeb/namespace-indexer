@@ -76,16 +76,17 @@ void idx_db_save_sync(sqlite3 *db, int64_t height, const uint8_t tip_hash[32]) {
     char hh[65]; tohex(tip_hash, 32, hh); meta_set(db, "tip", hh);
 }
 int64_t idx_db_get_peer_height(sqlite3 *db);
-// announcement evidence: only ever raises the stored value
+// Every writer is monotonic: peer_height is a high-water mark of evidence
+// (handshake start_height or an announced block). A lower claim — including
+// the first handshake after a restart, when in-memory state is empty — must
+// never pull the stored value down. set and raise are the same at the db.
 void idx_db_raise_peer_height(sqlite3 *db, int64_t h) {
     if (h <= 0 || h <= idx_db_get_peer_height(db)) return;
     char b[32]; snprintf(b, sizeof b, "%lld", (long long)h);
     meta_set(db, "peer_height", b);
 }
 void idx_db_set_peer_height(sqlite3 *db, int64_t h) {
-    if (h <= 0) return;
-    char b[32]; snprintf(b, sizeof b, "%lld", (long long)h);
-    meta_set(db, "peer_height", b);
+    idx_db_raise_peer_height(db, h);
 }
 int64_t idx_db_get_peer_height(sqlite3 *db) {
     char b[32]; return meta_get(db, "peer_height", b, sizeof b) ? strtoll(b, NULL, 10) : 0;

@@ -18,7 +18,7 @@
 # its header on libsecp.
 
 CC      ?= cc
-CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter
+CFLAGS  ?= -std=c11 -D_DEFAULT_SOURCE -O2 -Wall -Wextra -Wno-unused-parameter
 SMDIR   := protocol/impls/c/src
 SHIM    := protocol/shim/secp_shim.c
 SECPDIR := vendor/secp256k1
