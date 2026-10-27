@@ -648,6 +648,15 @@ static void sec_peer_height(const char *dir) {
       idx_db_set_peer_height(d2, 500);
       CHECK(idx_db_get_peer_height(d2) == 900, "restart: preset 900, handshake 500 → stays 900");
       idx_db_close(d2); unlink(q); }
+    // load seeds g_ph_disk from DB: after reset+load, note(500) must keep memory+DB at 900
+    { char q[256]; snprintf(q, sizeof q, "%s/ph_load.db", dir); unlink(q);
+      sqlite3 *d2 = idx_db_open(q); idx_db_set_peer_height(d2, 900);
+      CHECK(idx_db_get_peer_height(d2) == 900, "load-seed: preset 900");
+      idx_peer_height_reset();
+      idx_peer_height_load(d2);
+      CHECK(idx_peer_height_note(d2, 500, 1000, 1) == 900, "load-seed: note 500 keeps in-memory best at 900");
+      CHECK(idx_db_get_peer_height(d2) == 900, "load-seed: DB stays 900");
+      idx_db_close(d2); unlink(q); }
     idx_db_close(db); idx_peer_height_reset();
     unlink(p);
 }

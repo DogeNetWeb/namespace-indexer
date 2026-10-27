@@ -728,16 +728,35 @@ static int p2p_handshake(int fd, const uint8_t magic[4], int64_t our_height) {
 volatile int idx_sync_stop = 0;                 // embedding hosts only (indexer.h)
 static pthread_mutex_t g_ph_mu = PTHREAD_MUTEX_INITIALIZER;
 static int64_t g_ph_best = 0, g_ph_disk = 0, g_ph_at = 0;
+// Seed in-memory high-water from the DB so a post-restart note/handshake cannot
+// transiently set g_ph_disk below the stored value (raise alone keeps the DB safe;
+// load keeps the rate-limit cursor honest).
+void idx_peer_height_load(sqlite3 *db) {
+    int64_t h = db ? idx_db_get_peer_height(db) : 0;
+    if (h <= 0) return;
+    pthread_mutex_lock(&g_ph_mu);
+    if (h > g_ph_best) g_ph_best = h;
+    if (h > g_ph_disk) g_ph_disk = h;
+    pthread_mutex_unlock(&g_ph_mu);
+}
 int64_t idx_peer_height_note(sqlite3 *db, int64_t h, int64_t now, int force) {
     int64_t w = 0, best;
     pthread_mutex_lock(&g_ph_mu);
     if (h > g_ph_best) g_ph_best = h;
     if (db && g_ph_best > g_ph_disk && (force || now - g_ph_at >= IDX_PH_WRITE_MIN_S)) {
-        w = g_ph_best; g_ph_disk = w; g_ph_at = now;
+        w = g_ph_best; g_ph_at = now;            // g_ph_disk updated after raise from DB
     }
     best = g_ph_best;
     pthread_mutex_unlock(&g_ph_mu);
-    if (w) idx_db_raise_peer_height(db, w);     // monotonic vs the stored value too
+    if (w) {
+        idx_db_raise_peer_height(db, w);         // monotonic vs the stored value too
+        int64_t got = idx_db_get_peer_height(db);
+        pthread_mutex_lock(&g_ph_mu);
+        if (got > g_ph_disk) g_ph_disk = got;
+        if (got > g_ph_best) g_ph_best = got;
+        best = g_ph_best;
+        pthread_mutex_unlock(&g_ph_mu);
+    }
     return best;
 }
 void idx_peer_height_reset(void) {
@@ -1013,6 +1032,7 @@ static int cmd_sync(int argc, char **argv) {
     const Coin *coin = coin_by_name(argv[2]); if (!coin) { fprintf(stderr, "unknown coin %s\n", argv[2]); return 2; }
     const char *dbpath = argv[3]; const char *ip = argc > 4 ? argv[4] : "127.0.0.1";
     sqlite3 *db = idx_db_open(dbpath); if (!db) { fprintf(stderr, "cannot open %s\n", dbpath); return 1; }
+    idx_peer_height_load(db);                 // seed g_ph_* from meta before any handshake/note
     // A stored activation always wins (changing it mid-state would fork the fold);
     // the CLI value only seeds a fresh DB.
     int64_t cli_act = argc > 5 ? strtoll(argv[5], NULL, 10) : coin->activation;
@@ -2154,6 +2174,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
     const Coin *coin = coin_by_name(coinname); if (!coin) return -1;
     (void)self_nonce();                      // generate the version nonce now (before threads race)
     sqlite3 *db = idx_db_open(dbpath); if (!db) return -1;
+    idx_peer_height_load(db);                 // seed g_ph_* from meta before any handshake/note
     idx_db_peers_scrub(db);                  // drop pre-fix hostname addr rows
     int lfd = -1;
     if (port) {
