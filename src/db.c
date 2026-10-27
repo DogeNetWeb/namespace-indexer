@@ -641,6 +641,16 @@ int64_t idx_db_projected_height(sqlite3 *db) {
 // IDX_CKPT_EVERY, 0 = off); at most IDX_CKPT_KEEP rows are kept.
 #define IDX_CKPT_EVERY 1000
 #define IDX_CKPT_KEEP  4
+// State blob layout: u32 LE format version, then the fields below. Unknown
+// versions are rejected (fall back to an older row or full replay). The blob
+// is capped so a pathological state cannot balloon a local row; an oversize
+// state is simply not checkpointed (checkpoints are optional, never digested).
+#define IDX_CKPT_FMT_VER   1u
+#define IDX_CKPT_MAX_BYTES (64u * 1024 * 1024)
+size_t idx_ckpt_max_bytes = IDX_CKPT_MAX_BYTES;   // test override
+static void ckpt_reject(int64_t h, const char *why) {
+    fprintf(stderr, "rb_ckpt: rejected checkpoint at height %lld: %s\n", (long long)h, why);
+}
 typedef struct { uint8_t *p; size_t n, cap; int bad; } CkBuf;
 static void ck_put(CkBuf *b, const void *d, size_t n) {
     if (b->bad) return;
@@ -670,7 +680,7 @@ static int ck_exec(sqlite3 *db, const char *sql, int64_t h) {
 int idx_db_ckpt_prune_above(sqlite3 *db, int64_t height) {
     return ck_exec(db, "DELETE FROM rb_ckpt WHERE height>?1", height);
 }
-int idx_db_ckpt_wipe(sqlite3 *db) { return ck_exec(db, "DELETE FROM rb_ckpt WHERE ?1=?1", 0); }
+int idx_db_ckpt_wipe(sqlite3 *db) { return sqlite3_exec(db, "DELETE FROM rb_ckpt", NULL, NULL, NULL) == SQLITE_OK; }
 int idx_db_ckpt_count(sqlite3 *db) {
     sqlite3_stmt *st; int n = -1;
     if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM rb_ckpt", -1, &st, NULL) != SQLITE_OK) return -1;
@@ -679,6 +689,7 @@ int idx_db_ckpt_count(sqlite3 *db) {
 }
 int idx_db_ckpt_save(sqlite3 *db, SmState *s) {
     CkBuf b = {0};
+    { uint8_t v[4] = { IDX_CKPT_FMT_VER & 255, 0, 0, 0 }; ck_put(&b, v, 4); }
     ck_u64(&b, (uint64_t)s->cur_height); ck_u64(&b, (uint64_t)s->cur_mtp); ck_u64(&b, s->cur_rate);
     ck_u64(&b, (uint64_t)s->n_names);
     for (int i = 0; i < s->n_names; i++) {
@@ -700,6 +711,11 @@ int idx_db_ckpt_save(sqlite3 *db, SmState *s) {
     ck_u64(&b, (uint64_t)s->n_muts);
     for (int i = 0; i < s->n_muts; i++) { ck_put(&b, s->muts[i].owner, 20); ck_u64(&b, (uint64_t)s->muts[i].height); }
     if (b.bad) { free(b.p); return 0; }
+    if (b.n > idx_ckpt_max_bytes) {          // optional: skip, never fail the projection
+        fprintf(stderr, "rb_ckpt: state at height %lld is %zu bytes (> cap %zu); not checkpointed\n",
+                (long long)s->cur_height, b.n, idx_ckpt_max_bytes);
+        free(b.p); return 1;
+    }
     uint8_t dig[32]; sm_state_digest(s, dig);
     sqlite3_stmt *st; int ok = 0;
     if (sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO rb_ckpt(height,activation,digest,state) VALUES(?,?,?,?)", -1, &st, NULL) == SQLITE_OK) {
@@ -708,7 +724,21 @@ int idx_db_ckpt_save(sqlite3 *db, SmState *s) {
         ok = sqlite3_step(st) == SQLITE_DONE; sqlite3_finalize(st);
     }
     free(b.p);
-    if (ok) ok = ck_exec(db, "DELETE FROM rb_ckpt WHERE height NOT IN (SELECT height FROM rb_ckpt ORDER BY height DESC LIMIT ?1)", IDX_CKPT_KEEP);
+    // keep-N prune: find the N-th newest height and delete strictly below it.
+    // Two plain statements (no NOT IN / LIMIT-subquery semantics to rely on);
+    // fewer than N rows → nothing to delete.
+    if (ok) {
+        int64_t floor_h = -1; sqlite3_stmt *q;
+        if (sqlite3_prepare_v2(db, "SELECT height FROM rb_ckpt ORDER BY height DESC LIMIT 1 OFFSET ?1", -1, &q, NULL) != SQLITE_OK) ok = 0;
+        else {
+            sqlite3_bind_int64(q, 1, IDX_CKPT_KEEP - 1);
+            int rc = sqlite3_step(q);
+            if (rc == SQLITE_ROW) floor_h = sqlite3_column_int64(q, 0);
+            else if (rc != SQLITE_DONE) ok = 0;
+            sqlite3_finalize(q);
+        }
+        if (ok && floor_h >= 0) ok = ck_exec(db, "DELETE FROM rb_ckpt WHERE height<?1", floor_h);
+    }
     return ok;
 }
 // Called from idx_db_project inside its savepoint.
@@ -731,9 +761,17 @@ int64_t idx_db_ckpt_load(sqlite3 *db, int64_t max_height, SmState *s) {
     int64_t got = -1;
     while (got < 0 && sqlite3_step(st) == SQLITE_ROW) {
         int64_t h = sqlite3_column_int64(st, 0);
-        if (sqlite3_column_bytes(st, 1) != 32) continue;
+        if (sqlite3_column_bytes(st, 1) != 32) { ckpt_reject(h, "bad digest length"); continue; }
         uint8_t want[32]; memcpy(want, sqlite3_column_blob(st, 1), 32);
         CkRd r = { sqlite3_column_blob(st, 2), (size_t)sqlite3_column_bytes(st, 2), 0, 0 };
+        if (r.n > idx_ckpt_max_bytes) { ckpt_reject(h, "state blob over size cap"); continue; }
+        if (r.n < 4) { ckpt_reject(h, "state blob truncated"); continue; }
+        uint32_t ver = (uint32_t)r.p[0] | (uint32_t)r.p[1] << 8 | (uint32_t)r.p[2] << 16 | (uint32_t)r.p[3] << 24;
+        if (ver != IDX_CKPT_FMT_VER) {
+            char why[64]; snprintf(why, sizeof why, "unknown format version %u", ver);
+            ckpt_reject(h, why); continue;
+        }
+        r.o = 4;
         SmState *t = sm_new(s->activation_height);
         if (!t) break;
         t->cur_height = (int64_t)ck_g64(&r); t->cur_mtp = (int64_t)ck_g64(&r); t->cur_rate = ck_g64(&r);
@@ -761,9 +799,12 @@ int64_t idx_db_ckpt_load(sqlite3 *db, int64_t max_height, SmState *s) {
             if (!r.bad) sm_bump_mutation(t, ow, mh);
         }
         uint8_t dig[32];
-        if (!r.bad && r.o == r.n && t->cur_height == h) {
+        if (r.bad || r.o != r.n) ckpt_reject(h, "state blob malformed");
+        else if (t->cur_height != h) ckpt_reject(h, "height mismatch");
+        else {
             sm_state_digest(t, dig);
-            if (memcmp(dig, want, 32) == 0) {
+            if (memcmp(dig, want, 32) != 0) ckpt_reject(h, "digest mismatch");
+            else {
                 // swap the loaded rows into *s (caller's pointer kept)
                 SmState tmp = *s; *s = *t; *t = tmp;
                 got = h;
@@ -773,6 +814,23 @@ int64_t idx_db_ckpt_load(sqlite3 *db, int64_t max_height, SmState *s) {
     }
     sqlite3_finalize(st);
     return got;
+}
+
+// First checkpoint on open: an existing db upgraded to this build (or one
+// whose checkpoints were wiped) has an empty table while its tip may sit far
+// past activation; without this the first checkpoint waits a full interval.
+// Only when the loaded state IS the projection (cur_height == proj_height).
+// Returns 1 if one was taken, 0 if not needed, -1 on error.
+int idx_db_ckpt_seed(sqlite3 *db, SmState *s) {
+    int64_t every = idx_db_ckpt_every(db);
+    if (every <= 0 || idx_db_ckpt_count(db) != 0) return 0;
+    if (s->cur_height < (int64_t)s->activation_height + every) return 0;
+    if (idx_db_projected_height(db) != s->cur_height) return 0;
+    if (sqlite3_exec(db, "SAVEPOINT ckpt_seed", NULL, NULL, NULL) != SQLITE_OK) return -1;
+    int ok = idx_db_ckpt_save(db, s);
+    if (ok && sqlite3_exec(db, "RELEASE ckpt_seed", NULL, NULL, NULL) == SQLITE_OK) return idx_db_ckpt_count(db) > 0;
+    sqlite3_exec(db, "ROLLBACK TO ckpt_seed", NULL, NULL, NULL); sqlite3_exec(db, "RELEASE ckpt_seed", NULL, NULL, NULL);
+    return -1;
 }
 
 int idx_db_load_state(sqlite3 *db, SmState *s) {
