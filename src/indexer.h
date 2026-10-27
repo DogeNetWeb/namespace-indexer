@@ -54,6 +54,7 @@ extern volatile int64_t idx_sync_peer_height;
 // best height noted so far. db may be NULL (memory only).
 #define IDX_PH_WRITE_MIN_S 60
 struct sqlite3;
+void    idx_peer_height_load(struct sqlite3 *db);   /* seed g_ph_* from meta on db open */
 int64_t idx_peer_height_note(struct sqlite3 *db, int64_t h, int64_t now, int force);
 void    idx_peer_height_reset(void);   /* tests */
 
