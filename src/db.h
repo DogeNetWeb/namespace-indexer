@@ -117,6 +117,9 @@ int64_t idx_db_ckpt_load(sqlite3 *db, int64_t max_height, SmState *s);
 int     idx_db_ckpt_prune_above(sqlite3 *db, int64_t height);
 int     idx_db_ckpt_wipe(sqlite3 *db);
 int     idx_db_ckpt_count(sqlite3 *db);
+// Empty table + loaded projection >= activation+every: take one now (1), else 0; -1 error.
+int     idx_db_ckpt_seed(sqlite3 *db, SmState *s);
+extern size_t idx_ckpt_max_bytes;   // state blob cap (tests may lower it)
 
 // ── epochs projection (ownership history — substrate for overlay layers) ─
 // An append-only per-block record of every ownership CHANGE: (name, start_height,

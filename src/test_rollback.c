@@ -330,6 +330,125 @@ static void sec_ckpt(void) {
     }
 }
 
+// run fn with stderr captured to path; returns fn's result
+static int capture_err(const char *path, int (*fn)(void *), void *arg) {
+    fflush(stderr); int saved = dup(2), fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) { dup2(fd, 2); close(fd); }
+    int rc = fn(arg);
+    fflush(stderr); if (saved >= 0) { dup2(saved, 2); close(saved); }
+    return rc;
+}
+static int file_has(const char *path, const char *needle) {
+    FILE *f = fopen(path, "r"); if (!f) return 0;
+    char buf[8192]; size_t n = fread(buf, 1, sizeof buf - 1, f); fclose(f); buf[n] = 0;
+    return strstr(buf, needle) != NULL;
+}
+typedef struct { const char *db; int64_t fork; } ReorgArg;
+static int reorg_cb(void *a) { ReorgArg *r = a; return reorg_to(r->db, r->fork); }
+static int64_t q_i64(const char *dbpath, const char *sql) {
+    sqlite3 *db = idx_db_open(dbpath); int64_t v = -999; sqlite3_stmt *st;
+    if (db && sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+    }
+    idx_db_close(db); return v;
+}
+
+static void sec_polish(void) {
+    printf("\n-- E: checkpoint format / cap / wipe / prune / seed / reject log --\n");
+    char dbp[600], a[700], cmd[1600], log[700];
+    snprintf(dbp, sizeof dbp, "%s/E.db", g_dir); snprintf(log, sizeof log, "%s/E.log", g_dir);
+    if (!fresh(dbp, 5) || !sync_br(dbp, 'a', 0, NB - 1)) { CHECK(0, "E main fold"); return; }
+    // 1. format version
+    CHECK(q_i64(dbp, "SELECT COUNT(*) FROM rb_ckpt WHERE substr(state,1,4)=x'01000000'") == 4,
+          "every checkpoint blob starts with u32 LE format_ver=1");
+    snprintf(a, sizeof a, "%s.ver", dbp); snprintf(cmd, sizeof cmd, "cp %s %s", dbp, a);
+    {
+        int ok = system(cmd) == 0 && exec_sql(a, "UPDATE rb_ckpt SET state=x'02000000'||substr(state,5) WHERE height=29;"
+                                                 "UPDATE rb_ckpt SET state=substr(state,5) WHERE height=19");
+        ReorgArg r = { a, 33 };
+        ok = ok && capture_err(log, reorg_cb, &r) && sync_br(a, 'a', 34, NB - 1);
+        Snap z; snap(a, &z);
+        CHECK(ok && same_state(&z, ref('a')), "unknown format_ver (29) and pre-version blob (19) rejected; replay from 9 == fresh sync");
+        CHECK(file_has(log, "rejected checkpoint at height 29: unknown format version 2"),
+              "reject log names height 29 and reason 'unknown format version 2'");
+        CHECK(file_has(log, "rejected checkpoint at height 19: unknown format version"),
+              "reject log names the legacy (unversioned) row at 19");
+        rm_db(a);
+    }
+    // 2. reject log for digest mismatch
+    snprintf(a, sizeof a, "%s.dig", dbp); snprintf(cmd, sizeof cmd, "cp %s %s", dbp, a);
+    {
+        int ok = system(cmd) == 0 && exec_sql(a, "UPDATE rb_ckpt SET digest=zeroblob(32) WHERE height=29");
+        ReorgArg r = { a, 33 }; ok = ok && capture_err(log, reorg_cb, &r);
+        CHECK(ok && file_has(log, "rejected checkpoint at height 29: digest mismatch"), "reject log: height 29, digest mismatch");
+        rm_db(a);
+    }
+    // 3. size cap: save side (skip, projection still succeeds) and load side (reject + log)
+    {
+        char b[700]; snprintf(b, sizeof b, "%s.cap", dbp);
+        size_t old = idx_ckpt_max_bytes; idx_ckpt_max_bytes = 16;
+        int ok = fresh(b, 5) && sync_br(b, 'a', 0, NB - 1);
+        Snap z; snap(b, &z);
+        CHECK(ok && ckpts(b) == 0 && same_state(&z, ref('a')), "state over the size cap is not checkpointed; projection unaffected");
+        snprintf(cmd, sizeof cmd, "cp %s %s.cap2", dbp, dbp); snprintf(a, sizeof a, "%s.cap2", dbp);
+        ok = system(cmd) == 0;
+        ReorgArg r = { a, 33 }; ok = ok && capture_err(log, reorg_cb, &r);
+        idx_ckpt_max_bytes = old;
+        ok = ok && sync_br(a, 'a', 34, NB - 1); snap(a, &z);
+        CHECK(ok && file_has(log, "rejected checkpoint at height 29: state blob over size cap") && same_state(&z, ref('a')),
+              "oversize stored blob rejected on load with log; full replay == fresh sync");
+        rm_db(a); rm_db(b);
+    }
+    // 4. wipe is a plain DELETE
+    snprintf(a, sizeof a, "%s.wipe", dbp); snprintf(cmd, sizeof cmd, "cp %s %s", dbp, a);
+    {
+        int ok = system(cmd) == 0; sqlite3 *db = idx_db_open(a);
+        ok = ok && db && idx_db_ckpt_count(db) == 4 && idx_db_ckpt_wipe(db) && idx_db_ckpt_count(db) == 0;
+        idx_db_close(db);
+        CHECK(ok, "ckpt_wipe deletes every row");
+        rm_db(a);
+    }
+    // 5. keep-4 prune: highest 4 heights survive, whatever else is in the table
+    snprintf(a, sizeof a, "%s.prune", dbp); snprintf(cmd, sizeof cmd, "cp %s %s", dbp, a);
+    {
+        int ok = system(cmd) == 0 && exec_sql(a, "INSERT INTO rb_ckpt VALUES(1,0,zeroblob(32),x'00');"
+                                                 "INSERT INTO rb_ckpt VALUES(2,0,zeroblob(32),x'00');"
+                                                 "INSERT INTO rb_ckpt VALUES(3,0,NULL,NULL)");
+        Fold f; ok = ok && fold_open(&f, a);
+        if (ok) { ok = idx_db_ckpt_save(f.db, f.s); fold_close(&f); }
+        ok = ok && q_i64(a, "SELECT COUNT(*) FROM rb_ckpt") == 4
+                && q_i64(a, "SELECT MIN(height) FROM rb_ckpt") == 9 && q_i64(a, "SELECT MAX(height) FROM rb_ckpt") == 39;
+        CHECK(ok, "keep-4 prune: 7 rows -> exactly heights 9,19,29,39 kept");
+        ok = exec_sql(a, "DELETE FROM rb_ckpt WHERE height<39") && fold_open(&f, a);
+        if (ok) { ok = idx_db_ckpt_save(f.db, f.s); fold_close(&f); }
+        CHECK(ok && ckpts(a) == 1, "keep-4 prune with fewer than 4 rows deletes nothing");
+        rm_db(a);
+    }
+    // 6. seed on open
+    {
+        char b[700]; snprintf(b, sizeof b, "%s.seed", dbp);
+        int ok = fresh(b, 1000) && sync_br(b, 'a', 0, NB - 1) && ckpts(b) == 0;
+        Fold f;
+        ok = ok && fold_open(&f, b); int r1 = ok ? idx_db_ckpt_seed(f.db, f.s) : -9; if (ok) fold_close(&f);
+        CHECK(ok && r1 == 0 && ckpts(b) == 0, "seed: tip (39) not past activation+every (1000) -> no checkpoint");
+        { sqlite3 *d = idx_db_open(b); if (d) idx_db_ckpt_set_every(d, 5); idx_db_close(d); }
+        fold_open(&f, b); f.s->cur_height = 30; int rm = idx_db_ckpt_seed(f.db, f.s); fold_close(&f);
+        CHECK(rm == 0 && ckpts(b) == 0, "seed: loaded state not the projection (cursor != proj_height) -> skipped");
+        fold_open(&f, b); int r2 = idx_db_ckpt_seed(f.db, f.s); int r3 = idx_db_ckpt_seed(f.db, f.s); fold_close(&f);
+        CHECK(r2 == 1 && r3 == 0 && ckpts(b) == 1 && q_i64(b, "SELECT height FROM rb_ckpt") == 39,
+              "seed: empty table + tip far past activation -> one checkpoint at 39; second call no-op");
+        fold_open(&f, b); SmState *t = sm_new(f.s->activation_height);
+        int64_t got = idx_db_ckpt_load(f.db, 39, t); uint8_t d1[32], d2[32]; sm_state_digest(t, d1); sm_state_digest(f.s, d2);
+        sm_free(t); fold_close(&f);
+        CHECK(got == 39 && !memcmp(d1, d2, 32), "seeded checkpoint loads back with the projection's digest");
+        ok = reorg_to(b, 39);
+        Snap z; snap(b, &z);
+        CHECK(ok && same_state(&z, ref('a')), "rollback to the seeded height == fresh sync");
+        rm_db(b);
+    }
+}
+
 int main(void) {
     snprintf(g_dir, sizeof g_dir, "/tmp/rbtxn.XXXXXX");
     if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 2; }
@@ -350,6 +469,7 @@ int main(void) {
     sec_repeat();
     sec_crash();
     sec_ckpt();
+    sec_polish();
     char cmd[700]; snprintf(cmd, sizeof cmd, "rm -rf %s", g_dir); if (system(cmd) != 0) {}
     printf("\ntest_rollback: %s\n", g_fail ? "FAILED" : "ALL PASSED");
     return g_fail;
