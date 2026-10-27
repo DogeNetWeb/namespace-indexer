@@ -1095,6 +1095,8 @@ static int cmd_sync(int argc, char **argv) {
     // would stamp proj_height=0 at pass end — which the NEXT boot reads as a
     // crash gap and "recovers" a synced db all the way back to the checkpoint.
     s->cur_height = height;
+    if (idx_db_ckpt_seed(db, s) == 1)
+        fprintf(stderr, "rb_ckpt: first checkpoint taken on open at height %lld\n", (long long)height);
     FoldCtx fc = { .s = s, .db = db, .oracle = oracle };
     fold_load_watch(&fc);
     // serve cache: the header chain + rolling block window, a separate aux db
