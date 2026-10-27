@@ -1283,7 +1283,7 @@ static int cmd_sync(int argc, char **argv) {
         }
         if (idx_sync_peer_height > 0) {   // a handshake claim, never below announced evidence
             int64_t ev = idx_peer_height_note(NULL, 0, 0, 0);
-            idx_db_set_peer_height(db, idx_sync_peer_height > ev ? idx_sync_peer_height : ev);
+            idx_db_raise_peer_height(db, idx_sync_peer_height > ev ? idx_sync_peer_height : ev);  // db-monotonic
         }
         net_peer_str(fd, picked, sizeof picked);
         idx_db_peer_seen(db, picked, (int64_t)idx_sync_peer_services,
@@ -1318,7 +1318,7 @@ static int cmd_sync(int argc, char **argv) {
         snprintf((char *)idx_sync_peer_agent, sizeof idx_sync_peer_agent, "%s", fb_agent);
         if (idx_sync_peer_height > 0) {   // a handshake claim, never below announced evidence
             int64_t ev = idx_peer_height_note(NULL, 0, 0, 0);
-            idx_db_set_peer_height(db, idx_sync_peer_height > ev ? idx_sync_peer_height : ev);
+            idx_db_raise_peer_height(db, idx_sync_peer_height > ev ? idx_sync_peer_height : ev);  // db-monotonic
         }
         fprintf(stderr, "  no archive peer reachable — using limited peer %s\n", picked);
     }

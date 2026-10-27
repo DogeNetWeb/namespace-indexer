@@ -609,7 +609,7 @@ static void sec_rewalk(const char *dir) {
 // ── main ─────────────────────────────────────────────────────────────────────
 // peer_height from announcements: monotonic in memory and on disk, the meta
 // write rate-limited to one per IDX_PH_WRITE_MIN_S, force flushes, and a
-// handshake write may lower the stored value but announcements never do.
+// every write (handshake or announcement) is a monotonic max at the db.
 static void sec_peer_height(const char *dir) {
     printf("\n-- peer_height follows announcements --\n");
     char p[700]; snprintf(p, sizeof p, "%s/ph.db", dir);
@@ -634,6 +634,20 @@ static void sec_peer_height(const char *dir) {
     idx_db_set_peer_height(db, 5000);
     idx_db_raise_peer_height(db, 4000);
     CHECK(idx_db_get_peer_height(db) == 5000, "raise never lowers the stored value");
+    // restart: in-memory state wiped, then a lower handshake claim — stored stays
+    idx_db_set_peer_height(db, 900);
+    CHECK(idx_db_get_peer_height(db) == 5000, "set itself is monotonic (900 cannot replace 5000)");
+    idx_peer_height_reset();                                 // process restart
+    idx_db_set_peer_height(db, 500);                         // first handshake after restart
+    CHECK(idx_db_get_peer_height(db) == 5000, "restart: handshake 500 cannot lower stored 5000");
+    // exact scenario: preset 900, restart, handshake 500 → stay 900
+    { char q[700]; snprintf(q, sizeof q, "%s/ph2.db", dir);
+      sqlite3 *d2 = idx_db_open(q); idx_db_set_peer_height(d2, 900);
+      CHECK(idx_db_get_peer_height(d2) == 900, "preset 900");
+      idx_peer_height_reset();
+      idx_db_set_peer_height(d2, 500);
+      CHECK(idx_db_get_peer_height(d2) == 900, "restart: preset 900, handshake 500 → stays 900");
+      idx_db_close(d2); unlink(q); }
     idx_db_close(db); idx_peer_height_reset();
     unlink(p);
 }

@@ -52,4 +52,37 @@ run('headers run: known then child', [('headers', b'\x02' + hdr(bytes(32)) + b'\
 run('unknown inv/headers ignored', [('inv', inv(os.urandom(32))), ('headers', b'\x01' + hdr(os.urandom(32)) + b'\x00')], None)
 run('AuxPoW header stops the headers walk', [('headers', b'\x02' + hdr(Y, 0x104) + b'\x00' + hdr(X) + b'\x00')], 6)
 run('never lowered by a lower announcement', [('inv', inv(Y))], 900, preset=900)
+# True restart: store 900 under a live serve, kill it, start again, handshake
+# with start_height=500 and no announcements — peer_height must stay 900.
+def run_restart():
+    d = tempfile.mkdtemp(); db = os.path.join(d, 'db1')
+    s = sqlite3.connect(os.path.join(d, 'serve-doge.db'))
+    s.executescript("CREATE TABLE headers(height INTEGER PRIMARY KEY, hash BLOB, hdr BLOB);"
+                    "CREATE INDEX headers_hash ON headers(hash);"); s.commit(); s.close()
+    port = 18000 + (os.getpid() + 97) % 2000
+    def start():
+        return subprocess.Popen([IDX, 'serve', 'doge', db, str(port)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p = start()
+    try:
+        for _ in range(100):
+            try: socket.create_connection(('127.0.0.1', port), 1).close(); break
+            except OSError: time.sleep(0.05)
+        else: ck(False, 'restart: first serve listening'); return
+        m = sqlite3.connect(db); m.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('peer_height','900')"); m.commit(); m.close()
+    finally:
+        p.terminate(); p.wait(5)
+    p = start()
+    try:
+        for _ in range(100):
+            try: c = socket.create_connection(('127.0.0.1', port), 1); break
+            except OSError: time.sleep(0.05)
+        else: ck(False, 'restart: second serve listening'); return
+        c.sendall(msg('version', version(500)) + msg('verack')); time.sleep(0.6); c.close()
+    finally:
+        p.terminate(); p.wait(5)
+    m = sqlite3.connect(db); r = m.execute("SELECT v FROM meta WHERE k='peer_height'").fetchone(); m.close()
+    got = int(r[0]) if r else None
+    ck(got == 900, 'restart: handshake 500 cannot lower stored 900 (got %s)' % got)
+run_restart()
 sys.exit(1 if fails else 0)
