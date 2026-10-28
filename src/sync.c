@@ -2241,7 +2241,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
     ServeStore *ss = serve_store_open(serve_path);
     int64_t services = (ss && serve_store_tip(ss) >= 0) ? (1LL << 10) : 0;
     int64_t our_h = 0; { uint8_t tip[32]; idx_db_load_sync(db, &our_h, tip); }
-    if (port) fprintf(stderr, "serve: listening on 0.0.0.0:%u (agent %s, services 0x%llx)\n",
+    if (port) fprintf(stderr, "serve: listening on port %u (agent %s, services 0x%llx)\n",
                       port, idx_sync_agent, (unsigned long long)services);
     else fprintf(stderr, "serve: dial-only (agent %s, services 0x%llx)\n",
                  idx_sync_agent, (unsigned long long)services);
