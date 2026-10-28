@@ -20,6 +20,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include "netaddr.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -563,16 +564,9 @@ static int net_connect(const char *host, uint16_t port) {
 static void net_peer_str(int fd, char *out, size_t cap) {
     struct sockaddr_storage ss; socklen_t sl = sizeof ss;
     char ip[INET6_ADDRSTRLEN] = "?"; unsigned port = 0;
-    if (getpeername(fd, (struct sockaddr *)&ss, &sl) == 0) {
-        if (ss.ss_family == AF_INET) {
-            struct sockaddr_in *s4 = (struct sockaddr_in *)&ss;
-            inet_ntop(AF_INET, &s4->sin_addr, ip, sizeof ip); port = ntohs(s4->sin_port);
-        } else if (ss.ss_family == AF_INET6) {
-            struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&ss;
-            inet_ntop(AF_INET6, &s6->sin6_addr, ip, sizeof ip); port = ntohs(s6->sin6_port);
-        }
-    }
-    snprintf(out, cap, "%s:%u", ip, port);
+    if (getpeername(fd, (struct sockaddr *)&ss, &sl) == 0)
+        na_sockaddr((struct sockaddr *)&ss, ip, sizeof ip, &port);   // ::ffff:v4 → v4
+    na_join(out, cap, ip, port);                                     // "[v6]:port"
 }
 // Resolve a dial target to its first numeric address — no connect. Lets the
 // per-host dedup and the serve-live check see THROUGH a hostname before paying
@@ -585,13 +579,8 @@ static int net_resolve_str(const char *host, char *out, size_t cap) {
     if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return 0;
     int ok = 0;
     for (struct addrinfo *ai = res; ai && !ok; ai = ai->ai_next) {
-        if (ai->ai_family == AF_INET) {
-            inet_ntop(AF_INET, &((struct sockaddr_in *)ai->ai_addr)->sin_addr,
-                      out, (socklen_t)cap); ok = 1;
-        } else if (ai->ai_family == AF_INET6) {
-            inet_ntop(AF_INET6, &((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr,
-                      out, (socklen_t)cap); ok = 1;
-        }
+        if (ai->ai_family == AF_INET || ai->ai_family == AF_INET6)
+            ok = na_sockaddr(ai->ai_addr, out, cap, NULL) != 0;
     }
     freeaddrinfo(res);
     return ok;
@@ -628,14 +617,22 @@ static int ver_nonce(const uint8_t *pl, uint32_t pln, uint64_t *out) {
 // when the dial can't complete (no NAT hairpin → no handshake → the nonce check
 // can't fire). Best-effort cross-thread hint; a torn read just costs one extra
 // dial attempt.
-static char g_self_ip[INET_ADDRSTRLEN] = "";
+static char g_self_ip[INET6_ADDRSTRLEN] = "";
 // Record our external ip from a received version payload, if it carries a plausible
 // non-local IPv4 in addr_recv (0xFFFF-mapped at offset 38, quad at 40).
+// addr_recv ip = 16 bytes at offset 28. IPv4 (mapped) keeps the old rule
+// exactly; IPv6 must be globally routable (netaddr policy). 1 = host set.
+static int self_from_version(const uint8_t *pl, uint32_t pln, char *host, size_t cap) {
+    if (pln < 46) return 0;
+    if (pl[38] == 0xFF && pl[39] == 0xFF && !memcmp(pl + 28, "\0\0\0\0\0\0\0\0\0\0", 10)) {
+        unsigned a = pl[40];
+        if (!a || a == 127 || a == 10) return 0;
+    } else if (!na_routable16(pl + 28)) return 0;
+    na_from16(pl + 28, host, cap); return 1;
+}
 static void learn_self_ip(const uint8_t *pl, uint32_t pln) {
-    if (pln < 46 || pl[38] != 0xFF || pl[39] != 0xFF) return;
-    unsigned a = pl[40];
-    if (!a || a == 127 || a == 10) return;
-    snprintf(g_self_ip, sizeof g_self_ip, "%u.%u.%u.%u", pl[40], pl[41], pl[42], pl[43]);
+    char h[INET6_ADDRSTRLEN];
+    if (self_from_version(pl, pln, h, sizeof h)) snprintf(g_self_ip, sizeof g_self_ip, "%s", h);
 }
 // True when `host` resolves to the IPv4 we advertise as ourselves. `self` is the
 // serve loop's own learned addr ("ip:port", from an inbound peer); if it's NULL
@@ -645,19 +642,17 @@ static void learn_self_ip(const uint8_t *pl, uint32_t pln) {
 // can't fire. A no-op until one of the two has been learned.
 static int host_is_self(const char *host, const char *self) {
     char sip[64] = "";
-    if (self && *self) { snprintf(sip, sizeof sip, "%s", self); char *c = strrchr(sip, ':'); if (c) *c = 0; }
+    if (self && *self) { uint16_t sp; na_split(self, sip, sizeof sip, &sp, 0); }
     else if (g_self_ip[0]) snprintf(sip, sizeof sip, "%s", g_self_ip);
     else return 0;
     struct addrinfo hints, *res = NULL; memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return 0;
     int match = 0;
-    for (struct addrinfo *ai = res; ai && !match; ai = ai->ai_next)
-        if (ai->ai_family == AF_INET) {
-            char ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &((struct sockaddr_in *)ai->ai_addr)->sin_addr, ip, sizeof ip);
-            if (!strcmp(ip, sip)) match = 1;
-        }
+    for (struct addrinfo *ai = res; ai && !match; ai = ai->ai_next) {
+        char ip[INET6_ADDRSTRLEN];
+        if (na_sockaddr(ai->ai_addr, ip, sizeof ip, NULL) && !strcmp(ip, sip)) match = 1;
+    }
     freeaddrinfo(res); return match;
 }
 
@@ -667,8 +662,8 @@ static int host_is_self(const char *host, const char *self) {
 // host_is_self: our own host is our own host whichever port it names.
 static int addr_is_self(const char *addr) {
     if (!g_self_ip[0] || !addr) return 0;
-    size_t n = strlen(g_self_ip);
-    return !strncmp(addr, g_self_ip, n) && (addr[n] == ':' || addr[n] == '\0');
+    char h[INET6_ADDRSTRLEN + 8]; uint16_t p; na_split(addr, h, sizeof h, &p, 0);
+    return !strcmp(h, g_self_ip);
 }
 
 static int p2p_handshake(int fd, const uint8_t magic[4], int64_t our_height) {
@@ -780,10 +775,7 @@ volatile uint64_t idx_sync_peer_services = 0;   // this pass's peer services (in
 // "host[:port]" → host copy + port (dflt when absent). Bare IPv6 not supported
 // here — harvested/dialed text addrs are IPv4 or hostnames.
 static void peer_split(const char *s, char *host, size_t hcap, uint16_t *port, uint16_t dflt) {
-    snprintf(host, hcap, "%s", s);
-    *port = dflt;
-    char *c = strrchr(host, ':');
-    if (c && c[1] && strspn(c + 1, "0123456789") == strlen(c + 1)) { *c = 0; *port = (uint16_t)atoi(c + 1); }
+    na_split(s, host, hcap, port, dflt);                 // also "[v6]:port" / bare v6
 }
 static int cand_add(char (*cand)[80], int n, int max, const char *s) {
     if (!s || !*s || n >= max) return n;
@@ -808,13 +800,15 @@ static void addr_harvest(sqlite3 *db, const uint8_t *pl, uint32_t pl_len, int dn
         int64_t svc = 0; for (int b = 0; b < 8; b++) svc |= (int64_t)e[4 + b] << (8 * b);
         const uint8_t *ip = e + 12;
         static const uint8_t v4map[12] = { 0,0,0,0,0,0,0,0,0,0,0xFF,0xFF };
-        if (memcmp(ip, v4map, 12) != 0) continue;                    // IPv4 only for now
-        uint8_t a = ip[12], b2 = ip[13];
-        if (a == 0 || a == 127 || a == 10 || (a == 172 && b2 >= 16 && b2 <= 31) ||
-            (a == 192 && b2 == 168) || (a == 169 && b2 == 254)) continue;   // unroutable
+        if (memcmp(ip, v4map, 12) == 0) {                            // IPv4: rule unchanged
+            uint8_t a = ip[12], b2 = ip[13];
+            if (a == 0 || a == 127 || a == 10 || (a == 172 && b2 >= 16 && b2 <= 31) ||
+                (a == 192 && b2 == 168) || (a == 169 && b2 == 254)) continue;   // unroutable
+        } else if (!na_routable16(ip)) continue;                     // IPv6: global unicast only
         uint16_t port = (uint16_t)(e[28] << 8 | e[29]);
         if (!port) continue;
-        char addr[80]; snprintf(addr, sizeof addr, "%u.%u.%u.%u:%u", a, b2, ip[14], ip[15], port);
+        char h[INET6_ADDRSTRLEN], addr[80]; na_from16(ip, h, sizeof h);
+        na_join(addr, sizeof addr, h, port);
         // never harvest ourselves: we self-announce, so our own addr is gossiped
         // straight back at us and would otherwise land in the dial pool (as a
         // dnet=1 vouch off dnaddr, which the overlay dialer then seats).
@@ -1698,17 +1692,14 @@ void idx_crawl_status(IdxCrawlStatus *out) {
 // one addr entry: time(4) services(8) ip(16, v4-mapped) port(2 BE). IPv4 only.
 static int addr_entry(uint8_t *out, uint32_t *o, uint32_t cap,
                       const char *addr, int64_t services, int64_t t) {
-    unsigned a, b, cc, d, port;
-    if (sscanf(addr, "%u.%u.%u.%u:%u", &a, &b, &cc, &d, &port) != 5) return 0;
-    if (a > 255 || b > 255 || cc > 255 || d > 255 || port > 65535) return 0;
+    char h[80]; uint16_t port; uint8_t ip[16];
+    na_split(addr, h, sizeof h, &port, 0);
+    if (!port || !na_to16(h, ip)) return 0;
     if (*o + 30 > cap) return 0;
     out[(*o)++] = (uint8_t)t; out[(*o)++] = (uint8_t)(t >> 8);
     out[(*o)++] = (uint8_t)(t >> 16); out[(*o)++] = (uint8_t)(t >> 24);
     for (int i = 0; i < 8; i++) out[(*o)++] = (uint8_t)(services >> (8 * i));
-    for (int i = 0; i < 10; i++) out[(*o)++] = 0;
-    out[(*o)++] = 0xFF; out[(*o)++] = 0xFF;
-    out[(*o)++] = (uint8_t)a; out[(*o)++] = (uint8_t)b;
-    out[(*o)++] = (uint8_t)cc; out[(*o)++] = (uint8_t)d;
+    memcpy(out + *o, ip, 16); *o += 16;                  // v4-mapped or IPv6
     out[(*o)++] = (uint8_t)(port >> 8); out[(*o)++] = (uint8_t)port;
     return 1;
 }
@@ -1784,11 +1775,8 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
     if (!strcmp(cmd, "version")) {
         // learn our own address from their addr_recv (the ip THEY dialed) —
         // paired with our listen port, this is what we advertise as self
-        if (!*self && pln >= 46 && pl[38] == 0xFF && pl[39] == 0xFF) {
-            unsigned a = pl[40];
-            if (a && a != 127 && a != 10)
-                snprintf(self, 80, "%u.%u.%u.%u:%u", pl[40], pl[41], pl[42], pl[43], port);
-        }
+        { char sh[INET6_ADDRSTRLEN];
+          if (!*self && self_from_version(pl, pln, sh, sizeof sh)) na_join(self, 80, sh, port); }
         // capture the peer's subver (agent) — "/dogenet-" marks a mesh peer —
         // and its claimed start_height (the varstr's tail), the serve plane's
         // own network-tip signal (idx_serve_best_height)
@@ -2060,11 +2048,8 @@ static int serve_dial(const char *host, uint16_t port, const Coin *coin,
             uint64_t vn;                                             // did we dial ourselves?
             if (ver_nonce(pl, pn, &vn) && vn == self_nonce()) is_self = 1;
             if (pn >= 12 && services_out) { uint64_t sv = 0; for (int b = 0; b < 8; b++) sv |= (uint64_t)pl[4+b] << (8*b); *services_out = (int64_t)sv; }
-            if (self && lport && !*self && pn >= 46 && pl[38] == 0xFF && pl[39] == 0xFF) {
-                unsigned a = pl[40];
-                if (a && a != 127 && a != 10)
-                    snprintf(self, 80, "%u.%u.%u.%u:%u", pl[40], pl[41], pl[42], pl[43], lport);
-            }
+            { char sh[INET6_ADDRSTRLEN];
+              if (self && lport && !*self && self_from_version(pl, pn, sh, sizeof sh)) na_join(self, 80, sh, lport); }
             uint64_t off = 4+8+8+26+26+8, ua;
             if (pn > off) { ua = pl[off++];
                 if (ua == 0xFD && pn >= off + 2) { ua = pl[off] | (pl[off+1] << 8); off += 2; }
@@ -2100,8 +2085,7 @@ static int conn_host_live(SConn *conns, const SConn *except, const char *host) {
         SConn *c = &conns[i];
         if (c == except) continue;
         if (c->fd >= 0 && c->peer[0]) {
-            char ip[80]; snprintf(ip, sizeof ip, "%s", c->peer);
-            char *col = strrchr(ip, ':'); if (col) *col = 0;
+            char ip[80]; uint16_t pp; na_split(c->peer, ip, sizeof ip, &pp, 0);
             if (!strcmp(ip, host)) return 1;
         }
         // two DISCONNECTED configured seats for one peer (a --peer plus the
@@ -2177,13 +2161,13 @@ static void mesh_seat_topup(SConn *conns, sqlite3 *db, const Coin *coin, int tar
 #define CHAIN_DIAL_TARGET 8
 // IPv4 /16 netgroup equality on "a.b.c.d[:port]" text (Core buckets by /16;
 // a hostname never matches an ip, which is the right miss).
+// IPv6: /32 group. Hostnames match nothing.
 static int same_group16(const char *a, const char *b) {
-    int dots = 0;
-    for (size_t i = 0; a[i] && b[i]; i++) {
-        if (a[i] != b[i]) return 0;
-        if (a[i] == '.' && ++dots == 2) return 1;
-    }
-    return 0;
+    char ha[80], hb[80], ga[80], gb[80]; uint16_t p; uint8_t t[16];
+    na_split(a, ha, sizeof ha, &p, 0); na_split(b, hb, sizeof hb, &p, 0);
+    if (!na_to16(ha, t) || !na_to16(hb, t)) return 0;
+    na_group(ha, ga, sizeof ga); na_group(hb, gb, sizeof gb);
+    return !strcmp(ga, gb);
 }
 static void chain_topup(SConn *conns, sqlite3 *db, const Coin *coin, const char *self) {
     int have = 0, slot = -1;
@@ -2229,12 +2213,11 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
     idx_db_peers_scrub(db);                  // drop pre-fix hostname addr rows
     int lfd = -1;
     if (port) {
-        lfd = socket(AF_INET, SOCK_STREAM, 0);
-        if (lfd < 0) { idx_db_close(db); return -1; }
-        int yes = 1; setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
-        struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
-        sa.sin_family = AF_INET; sa.sin_addr.s_addr = INADDR_ANY; sa.sin_port = htons(port);
-        if (bind(lfd, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(lfd, 16) != 0) {
+        int fam = 0;
+        lfd = na_listen_any(port, 16, na_ipv6_allowed(), &fam);   // dual-stack, logged v4 fallback
+        if (lfd >= 0)
+            fprintf(stderr, "serve: listening on port %u (%s)\n", port, fam == 6 ? "dual-stack IPv4+IPv6" : "IPv4 only");
+        if (lfd < 0) {
             // The port is already taken — almost always a full node (Pepecoin
             // Core) bound to the chain port on the same box. That must NOT kill
             // the serve plane: this thread also carries the DNS mesh gossip and
@@ -2452,7 +2435,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                     // redialing one dead addr every 15s: an outbound-only peer
                     // announcing a port it can't serve would pin it forever.
                     if (c->chain_seat || c->mesh_seat) {
-                        char addr[96]; snprintf(addr, sizeof addr, "%s:%u", c->host, c->rport);
+                        char addr[96]; na_join(addr, sizeof addr, c->host, c->rport);
                         idx_db_peer_tried(db, addr, (int64_t)now);
                         if (c->mesh_seat)   // small curated pool — one line per backoff window
                             fprintf(stderr, "serve: dial %s failed — backing off %ds  [mesh]\n",
@@ -2469,8 +2452,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                 // and the seat identity snaps to where the socket actually landed
                 // (a multi-A-record name can resolve one way and connect another)
                 net_peer_str(fd, c->peer, sizeof c->peer);
-                char pip[80]; snprintf(pip, sizeof pip, "%s", c->peer);
-                { char *pc = strrchr(pip, ':'); if (pc) *pc = 0; }
+                char pip[80]; { uint16_t pp; na_split(c->peer, pip, sizeof pip, &pp, 0); }
                 snprintf(c->hip, sizeof c->hip, "%s", pip);
                 // belt-and-braces: the pre-dial park makes this unreachable unless
                 // the connect landed on an address no dedup could see in advance
@@ -2520,17 +2502,15 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
         if (lfd >= 0 && (pfd[0].revents & POLLIN)) {
             int cfd = accept(lfd, NULL, NULL);
             if (cfd >= 0) {
-                char ip[INET_ADDRSTRLEN] = ""; unsigned rport = 0;
-                struct sockaddr_in pa; socklen_t pl2 = sizeof pa;
-                if (getpeername(cfd, (struct sockaddr *)&pa, &pl2) == 0) {
-                    inet_ntop(AF_INET, &pa.sin_addr, ip, sizeof ip);
-                    rport = ntohs(pa.sin_port);
-                }
+                char ip[INET6_ADDRSTRLEN] = ""; unsigned rport = 0;
+                struct sockaddr_storage pa; socklen_t pl2 = sizeof pa;
+                if (getpeername(cfd, (struct sockaddr *)&pa, &pl2) == 0)
+                    na_sockaddr((struct sockaddr *)&pa, ip, sizeof ip, &rport);   // ::ffff:v4 → v4
                 int from_host = 0;
-                for (int i = 0; i < SERVE_MAX_CONN; i++)
-                    if (conns[i].fd >= 0 && !conns[i].outbound && ip[0] &&
-                        !strncmp(conns[i].peer, ip, strlen(ip)) &&
-                        conns[i].peer[strlen(ip)] == ':') from_host++;
+                for (int i = 0; i < SERVE_MAX_CONN; i++) {
+                    char ph[80]; uint16_t pp; na_split(conns[i].peer, ph, sizeof ph, &pp, 0);
+                    if (conns[i].fd >= 0 && !conns[i].outbound && ip[0] && !strcmp(ph, ip)) from_host++;
+                }
                 int slot = -1;
                 for (int i = 0; i < SERVE_MAX_CONN; i++) if (conns[i].fd < 0 && !conns[i].outbound) { slot = i; break; }
                 if (slot < 0 || from_host >= SERVE_INBOUND_PER_HOST) {
@@ -2547,7 +2527,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                     memset(&conns[slot], 0, sizeof conns[slot]);
                     conns[slot].fd = cfd; conns[slot].magic = coin->magic;
                     conns[slot].last_rx = time(NULL);   // handshake clock starts now
-                    if (ip[0]) snprintf(conns[slot].peer, 80, "%s:%u", ip, rport);
+                    if (ip[0]) na_join(conns[slot].peer, 80, ip, rport);
                 }
             }
         }
@@ -2633,24 +2613,19 @@ static void probe_close(CrawlProbe *p) {
 // hostname candidate (an explicit `extra` target) resolves synchronously —
 // the db frontier is numeric ip:port text, so this stays off the hot path.
 static int probe_connect_start(const char *host, uint16_t port) {
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET; sa.sin_port = htons(port);
-    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
-        struct addrinfo hints, *res = NULL;
-        memset(&hints, 0, sizeof hints);
-        hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
-        char ps[8]; snprintf(ps, sizeof ps, "%u", port);
-        if (getaddrinfo(host, ps, &hints, &res) != 0 || !res) return -1;
-        sa = *(struct sockaddr_in *)res->ai_addr;
-        sa.sin_port = htons(port);
-        freeaddrinfo(res);
-    }
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_storage sa; socklen_t sl;
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
+    char ps[8]; snprintf(ps, sizeof ps, "%u", port);
+    if (getaddrinfo(host, ps, &hints, &res) != 0 || !res) return -1;   // numeric: no DNS
+    memcpy(&sa, res->ai_addr, res->ai_addrlen); sl = res->ai_addrlen;
+    freeaddrinfo(res);
+    int fd = socket(sa.ss_family, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int fl = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0 && errno != EINPROGRESS) {
+    if (connect(fd, (struct sockaddr *)&sa, sl) != 0 && errno != EINPROGRESS) {
         close(fd);
         return -1;
     }
@@ -2700,7 +2675,7 @@ int idx_crawl(const char *coinname, const char *dbpath, const char *extra,
             if (fd < 0) { fprintf(stderr, "  %s:%u down\n", host, port); continue; }
             memset(p, 0, sizeof *p);
             p->fd = fd; p->state = 1; p->deadline = now + CRAWL_CONNECT_S;
-            snprintf(p->cand, sizeof p->cand, "%s:%u", host, port);
+            na_join(p->cand, sizeof p->cand, host, port);
         }
         int live = 0;
         for (int i = 0; i < CRAWL_PAR; i++) if (pr[i].fd >= 0) live++;

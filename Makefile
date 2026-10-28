@@ -37,7 +37,7 @@ ENGINE_CURVE_SRCS := $(addprefix $(SMDIR)/,$(addsuffix .c,$(ENGINE_CURVE)))
 # Indexer sources.
 IDX_SRCS := src/main.c src/attrib.c src/adapter.c src/oracle_feed.c \
             src/db.c src/chain.c src/base58.c src/sync.c src/pow.c src/serve_store.c \
-            src/txcheck.c src/mempool.c $(SHIM) src/test_chain.c
+            src/txcheck.c src/mempool.c src/netaddr.c $(SHIM) src/test_chain.c
 
 SQLITE_CFLAGS := $(shell pkg-config --cflags sqlite3 2>/dev/null)
 SQLITE_LIBS   := $(shell pkg-config --libs sqlite3 2>/dev/null || echo -lsqlite3)
@@ -110,12 +110,17 @@ test_serve: src/test_serve.c src/serve_store.c src/serve_store.h
 test_relay: $(TEST_SRCS) src/test_relay.c src/relay_policy.h $(SECPLIB)
 	$(CC) $(CFLAGS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ $(TEST_SRCS) src/test_relay.c $(LIBS)
 
-# `make check` = the seven suites + the wire-level python tests. Run `make test`
+# test_netaddr: IPv4/IPv6 text, policy, dual-stack listen (+ v6 loopback connect;
+# run under `unshare -rn` with lo up, or on any host with ::1).
+test_netaddr: src/test_netaddr.c src/netaddr.c src/netaddr.h
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ src/test_netaddr.c src/netaddr.c
+
+# `make check` = the suites + the wire-level python tests. Run `make test`
 # for the shipped selftest. The python tests open loopback sockets; run under
 # `unshare -rn` (they bring `lo` up themselves when they can).
 # Every suite runs even if an earlier one fails; the target fails if any did.
-check: test_db test_sync test_codec test_serve test_reorg test_rollback test_relay indexerd
-	@rc=0; for t in ./test_db ./test_sync ./test_codec ./test_serve ./test_reorg ./test_rollback ./test_relay; do \
+check: test_db test_sync test_codec test_serve test_reorg test_rollback test_relay test_netaddr indexerd
+	@rc=0; for t in ./test_db ./test_sync ./test_codec ./test_serve ./test_reorg ./test_rollback ./test_relay ./test_netaddr; do \
 	  echo "=== $$t ==="; $$t || rc=1; done; \
 	echo "=== scripts/test_peer_height.py ==="; python3 scripts/test_peer_height.py ./indexerd || rc=1; \
 	echo "=== scripts/test_feefilter.py ==="; python3 scripts/test_feefilter.py ./indexerd || rc=1; \
@@ -124,6 +129,6 @@ check: test_db test_sync test_codec test_serve test_reorg test_rollback test_rel
 	if [ $$rc -eq 0 ]; then echo "check: ALL PASSED"; else echo "check: FAILED"; fi; exit $$rc
 
 check-clean:
-	rm -f test_db test_sync test_codec test_serve test_reorg test_rollback test_relay
+	rm -f test_db test_sync test_codec test_serve test_reorg test_rollback test_relay test_netaddr
 
 .PHONY: check check-clean

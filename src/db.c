@@ -2,6 +2,7 @@
 #include "db.h"
 #include "indexer.h"        // IDX_DNET_MARK — the overlay bucket's agent prefix
 #include "oracle_feed.h"
+#include "netaddr.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -165,8 +166,7 @@ void idx_db_peers_scrub(sqlite3 *db) {
     while (sqlite3_step(st) == SQLITE_ROW && n < 64) {
         const char *a = (const char *)sqlite3_column_text(st, 0);
         if (!a) continue;
-        char host[80]; snprintf(host, sizeof host, "%s", a);
-        char *col = strrchr(host, ':'); if (col) *col = 0;
+        char host[80]; uint16_t hp; na_split(a, host, sizeof host, &hp, 0);   // "[v6]:port" aware
         struct in_addr a4; struct in6_addr a6;
         if (inet_pton(AF_INET, host, &a4) != 1 && inet_pton(AF_INET6, host, &a6) != 1)
             snprintf(stale[n++], sizeof stale[0], "%s", a);
