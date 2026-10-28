@@ -1533,7 +1533,8 @@ invalid_peer:
 // (client + seed) that host has no other peer, so its sync starved until the
 // mesh conn dropped and the two planes flapped forever. Still strict enough
 // that one looping host can't eat the table (64 slots, 3 per host).
-#define SERVE_INBOUND_PER_HOST 3
+#define SERVE_INBOUND_PER_HOST 3          /* per v4 address / per v6 /64 */
+#define SERVE_INBOUND_PER_V6_48 6         /* aggregate per v6 /48 */
 
 typedef struct {
     int fd;
@@ -1734,7 +1735,7 @@ static void serve_send_dnaddr(SConn *c, const Coin *coin, sqlite3 *db,
     int n = idx_db_peers_dnet(db, pool, SERVE_DNADDR_MAX, 0);
     // advertise ourselves iff we listen and learned our external ip (a dial-only
     // node has neither, and correctly stays out of everyone's dnaddr)
-    int adv_self = (port && self && *self) ? 1 : 0;
+    int adv_self = (port && self && *self && na_self_advertisable(self)) ? 1 : 0;
     int total = n + adv_self; if (total > SERVE_DNADDR_MAX) total = SERVE_DNADDR_MAX;
     uint8_t *out = malloc(3 + (size_t)SERVE_DNADDR_MAX * 30);
     if (!out) return;
@@ -1760,6 +1761,7 @@ static void serve_send_dnaddr(SConn *c, const Coin *coin, sqlite3 *db,
 // REACHING the announced port is still the operator's port-forward.
 static void serve_announce_self(const SConn *c, const Coin *coin,
                                 const char *self, int64_t services) {
+    if (!na_self_advertisable(self)) return;   // own v6 only with --advertise-v6
     uint8_t out[3 + 30];
     int vo = 0;
     put_varint(out, &vo, 1);
@@ -1832,11 +1834,12 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         int n = idx_db_peers_rows(db, rows, 1000);
         uint8_t *out = malloc(3 + 1001u * 30);
         if (!out) { free(rows); return; }
-        int total = n + (*self ? 1 : 0); if (total > 1000) total = 1000;
+        int adv = *self && na_self_advertisable(self);
+        int total = n + adv; if (total > 1000) total = 1000;
         int vo = 0; put_varint(out, &vo, (uint64_t)total);
         uint32_t o = (uint32_t)vo;
         int64_t now = (int64_t)time(NULL); int put = 0;
-        if (*self && put < total) put += addr_entry(out, &o, 3 + 1001u*30, self, 0, now);
+        if (adv && put < total) put += addr_entry(out, &o, 3 + 1001u*30, self, 0, now);
         for (int i = 0; i < n && put < total; i++)
             put += addr_entry(out, &o, 3 + 1001u*30, rows[i].addr, rows[i].services, rows[i].last_seen);
         net_send(c->fd, coin->magic, "addr", out, o);
@@ -2513,13 +2516,18 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                 struct sockaddr_storage pa; socklen_t pl2 = sizeof pa;
                 if (getpeername(cfd, (struct sockaddr *)&pa, &pl2) == 0)
                     na_sockaddr((struct sockaddr *)&pa, ip, sizeof ip, &rport);   // ::ffff:v4 → v4
-                int from_host = 0;
+                // per-host cap: exact v4 (unchanged); IPv6 counts the whole /64,
+                // plus a looser /48 aggregate so one site can't fill the table
+                int from_host = 0, from_48 = 0, v6 = strchr(ip, ':') != NULL;
                 for (int i = 0; i < SERVE_MAX_CONN; i++) {
                     char ph[80]; uint16_t pp; na_split(conns[i].peer, ph, sizeof ph, &pp, 0);
-                    if (conns[i].fd >= 0 && !conns[i].outbound && ip[0] && !strcmp(ph, ip)) from_host++;
+                    if (conns[i].fd < 0 || conns[i].outbound || !ip[0]) continue;
+                    if (na_same_key(ph, ip, 64)) from_host++;
+                    if (v6 && na_same_key(ph, ip, 48)) from_48++;
                 }
                 int slot = -1;
                 for (int i = 0; i < SERVE_MAX_CONN; i++) if (conns[i].fd < 0 && !conns[i].outbound) { slot = i; break; }
+                if (from_48 >= SERVE_INBOUND_PER_V6_48) from_host = SERVE_INBOUND_PER_HOST;
                 if (slot < 0 || from_host >= SERVE_INBOUND_PER_HOST) {
                     // rate-limited: an old-build peer bounces its transients off
                     // the cap every few seconds — one line a minute, not a flood

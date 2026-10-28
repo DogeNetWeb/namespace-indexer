@@ -128,3 +128,38 @@ int na_listen_any(uint16_t port, int backlog, int allow_v6, int *fam_out) {
     if (fam_out) *fam_out = 4;
     return fd;
 }
+
+// ── ban/cap keys + self-advertise gate (local policy only; no wire change) ──
+// IPv4 (and ::ffff:-mapped) keys on the exact address, as before. IPv6 keys on
+// a prefix: one /64 is one end site (SLAAC/privacy rotate the low 64 bits
+// freely), so bans and per-host caps must not hand out a slot per /128.
+int na_key(const char *host, int v6bits, char *out, size_t cap) {
+    uint8_t ip[16]; int f = host ? na_to16(host, ip) : 0;
+    if (f == 4) { snprintf(out, cap, "%u.%u.%u.%u", ip[12], ip[13], ip[14], ip[15]); return 4; }
+    if (f == 6) {
+        int nb = v6bits == 48 ? 6 : 8;
+        int o = snprintf(out, cap, "v6/%d:", nb * 8);
+        for (int i = 0; i < nb && o > 0 && (size_t)o < cap; i += 2)
+            o += snprintf(out + o, cap - (size_t)o, "%s%02x%02x", i ? ":" : "", ip[i], ip[i + 1]);
+        return 6;
+    }
+    snprintf(out, cap, "%s", host ? host : ""); return 0;
+}
+int na_same_key(const char *a, const char *b, int v6bits) {
+    if (!a || !b || !*a || !*b) return 0;
+    char ka[NA_HOST_MAX], kb[NA_HOST_MAX];
+    na_key(a, v6bits, ka, sizeof ka); na_key(b, v6bits, kb, sizeof kb);
+    return !strcmp(ka, kb);
+}
+static int g_adv_v6 = -1;                                 // -1 = read env once
+void na_set_advertise_v6(int on) { g_adv_v6 = on ? 1 : 0; }
+int na_advertise_v6(void) {
+    if (g_adv_v6 < 0) { const char *e = getenv("IDX_ADVERTISE_V6"); g_adv_v6 = (e && !strcmp(e, "1")) ? 1 : 0; }
+    return g_adv_v6;
+}
+int na_self_advertisable(const char *hostport) {
+    if (!hostport || !*hostport) return 0;
+    char h[NA_HOST_MAX]; uint16_t p; na_split(hostport, h, sizeof h, &p, 0);
+    uint8_t ip[16]; int f = na_to16(h, ip);
+    return f == 6 ? na_advertise_v6() : 1;
+}

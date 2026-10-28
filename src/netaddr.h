@@ -35,6 +35,16 @@ int  na_sockaddr(const struct sockaddr *sa, char *host, size_t cap, unsigned *po
  * back to AF_INET 0.0.0.0. allow_v6=0 (env IDX_IPV6=0) forces v4 only.
  * *fam_out = 6 dual-stack, 4 v4-only. Returns fd or -1. One fd either way. */
 int  na_listen_any(uint16_t port, int backlog, int allow_v6, int *fam_out);
+/* ban/cap key. v4 (incl. ::ffff:-mapped) → exact dotted quad (unchanged);
+ * v6 → prefix key "v6/64:xxxx:xxxx:xxxx:xxxx" (v6bits 64) or "v6/48:…" (48);
+ * non-numeric → the text as-is. Returns 4, 6 or 0. */
+int  na_key(const char *host, int v6bits, char *out, size_t cap);
+int  na_same_key(const char *a, const char *b, int v6bits);  /* 1 = same key */
+/* Self-advertise of our own IPv6 is opt-in: --advertise-v6 or IDX_ADVERTISE_V6=1.
+ * Listening dual-stack is unaffected; only which self address we gossip. */
+int  na_advertise_v6(void);
+void na_set_advertise_v6(int on);
+int  na_self_advertisable(const char *hostport);          /* v4 → 1; v6 → opt-in */
 int  na_ipv6_allowed(void);                              /* env IDX_IPV6 != "0" */
 
 #endif

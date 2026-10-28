@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #include <errno.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -88,6 +89,36 @@ int main(void) {
         if (v4 >= 0) close(v4);
         setenv("IDX_IPV6", "0", 1); CK(!na_ipv6_allowed(), "IDX_IPV6=0 disables v6"); unsetenv("IDX_IPV6");
         CK(na_ipv6_allowed(), "v6 allowed by default");
+    }
+
+    // ── ban/cap keys: v4 exact (mapped = v4), v6 /64 and /48 ──
+    {
+        char k[NA_HOST_MAX];
+        CK(na_key("1.2.3.4", 64, k, sizeof k) == 4 && !strcmp(k, "1.2.3.4"), "key v4 exact");
+        CK(na_key("::ffff:1.2.3.4", 64, k, sizeof k) == 4 && !strcmp(k, "1.2.3.4"), "key v4-mapped == v4");
+        CK(!na_same_key("1.2.3.4", "1.2.3.5", 64), "v4 neighbours stay distinct (unchanged)");
+        CK(na_key("2a01:4f8:1:2::1", 64, k, sizeof k) == 6 && !strcmp(k, "v6/64:2a01:04f8:0001:0002"), "key v6 /64 text");
+        CK(na_same_key("2a01:4f8:1:2::1", "2a01:4f8:1:2:dead:beef:0:9", 64), "same /64 → same key");
+        CK(!na_same_key("2a01:4f8:1:2::1", "2a01:4f8:1:3::1", 64), "different /64 → different key");
+        CK(na_same_key("2a01:4f8:1:2::1", "2a01:4f8:1:ff::1", 48), "same /48 aggregates");
+        CK(!na_same_key("2a01:4f8:1:2::1", "2a01:4f8:2:2::1", 48), "different /48 distinct");
+        CK(!na_same_key("seed.example", "seed.example2", 64) && na_same_key("seed.example", "seed.example", 64), "hostnames compare exactly");
+    }
+    // ── self-advertise of our own v6 is opt-in ──
+    {
+        pid_t pid = fork();
+        if (pid == 0) { unsetenv("IDX_ADVERTISE_V6");
+            _exit(na_self_advertisable("[2a01:4f8::1]:22556") == 0 && na_self_advertisable("1.2.3.4:22556") == 1 ? 0 : 1); }
+        int st = 0; waitpid(pid, &st, 0);
+        CK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "default: own v6 NOT advertised, own v4 advertised");
+        pid = fork();
+        if (pid == 0) { setenv("IDX_ADVERTISE_V6", "1", 1);
+            _exit(na_self_advertisable("[2a01:4f8::1]:22556") == 1 ? 0 : 1); }
+        st = 0; waitpid(pid, &st, 0);
+        CK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "IDX_ADVERTISE_V6=1 → own v6 advertised");
+        na_set_advertise_v6(0); CK(!na_self_advertisable("[2a01:4f8::1]:1") && na_self_advertisable("1.2.3.4:1"), "set off: v6 no, v4 yes");
+        na_set_advertise_v6(1); CK(na_self_advertisable("[2a01:4f8::1]:1"), "set on (--advertise-v6): v6 yes");
+        na_set_advertise_v6(0);
     }
 
     if (g_fail) { printf("test_netaddr: %d FAIL\n", g_fail); return 1; }
