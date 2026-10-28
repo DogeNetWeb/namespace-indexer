@@ -122,6 +122,7 @@ test_netaddr: src/test_netaddr.c src/netaddr.c src/netaddr.h
 check: test_db test_sync test_codec test_serve test_reorg test_rollback test_relay test_netaddr indexerd
 	@rc=0; for t in ./test_db ./test_sync ./test_codec ./test_serve ./test_reorg ./test_rollback ./test_relay ./test_netaddr; do \
 	  echo "=== $$t ==="; $$t || rc=1; done; \
+	echo "=== scripts/test_dial_peers.sh ==="; sh scripts/test_dial_peers.sh ./indexerd || rc=1; \
 	echo "=== scripts/test_peer_height.py ==="; python3 scripts/test_peer_height.py ./indexerd || rc=1; \
 	echo "=== scripts/test_feefilter.py ==="; python3 scripts/test_feefilter.py ./indexerd || rc=1; \
 	echo "=== scripts/test_redial.py ==="; python3 scripts/test_redial.py ./indexerd || rc=1; \

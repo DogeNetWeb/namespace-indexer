@@ -2421,7 +2421,12 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                     c->outbound = 0; c->mesh_seat = 0; c->chain_seat = 0; c->host[0] = 0; c->hip[0] = 0; continue;
                 }
                 char agent[128]; int64_t psvc = 0, ph = 0; int gvk = 0;
-                int fd = serve_dial(c->hip, c->rport, coin, services, our_h, agent, &psvc,
+                // dial the NAME when the seat has one: net_connect walks every
+                // getaddrinfo result in order (v6 and v4), so a dead first
+                // record no longer strands the seat. hip (first record) only
+                // fed the dedup above; the identity snaps to the connected
+                // address after the dial.
+                int fd = serve_dial(c->host[0] ? c->host : c->hip, c->rport, coin, services, our_h, agent, &psvc,
                                     self, port, &ph, &gvk);
                 if (fd == -2) {   // handshake proved the peer is us — drop it for good
                     fprintf(stderr, "serve: %s:%u is ourselves (self-connect) — dropping self-seed\n", c->host, c->rport);
@@ -2619,6 +2624,15 @@ static int probe_connect_start(const char *host, uint16_t port) {
     hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
     char ps[8]; snprintf(ps, sizeof ps, "%u", port);
     if (getaddrinfo(host, ps, &hints, &res) != 0 || !res) return -1;   // numeric: no DNS
+    if (res->ai_next) {
+        // several records (a hostname extra): walk them all in getaddrinfo
+        // order with the bounded net_connect; the returned fd is already
+        // connected, so the caller's POLLOUT fires at once.
+        freeaddrinfo(res);
+        int cfd = net_connect(host, port);
+        if (cfd >= 0) fcntl(cfd, F_SETFL, fcntl(cfd, F_GETFL, 0) | O_NONBLOCK);
+        return cfd;
+    }
     memcpy(&sa, res->ai_addr, res->ai_addrlen); sl = res->ai_addrlen;
     freeaddrinfo(res);
     int fd = socket(sa.ss_family, SOCK_STREAM, 0);
