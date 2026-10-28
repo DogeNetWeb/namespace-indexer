@@ -2092,6 +2092,8 @@ static int conn_host_live(SConn *conns, const SConn *except, const char *host) {
         // same addr re-listed from the peers table, or a hostname seed and
         // its numeric row) must not park each other forever: the lower slot
         // owns the dial, the higher one parks behind it.
+        // (bc9f1fa redial tiebreak; supersedes the simpler !except approach of
+        // 6b949d4 / pep 985807d while keeping the same-IP single-connect rule.)
         if (c->fd < 0 && c->outbound && except && except->outbound &&
             !c->mesh_seat && !c->chain_seat && !except->mesh_seat && !except->chain_seat &&
             c > except) continue;
