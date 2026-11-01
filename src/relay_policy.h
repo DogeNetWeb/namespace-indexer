@@ -1,6 +1,12 @@
 // relay_policy.h — local relay policy helpers for the serve loop (no wire or
 // on-chain format change). Pure functions so test_relay can pin them.
 //
+//  • BIP133 feefilter: a peer that sent `feefilter` (int64 LE, koinu per 1000
+//    bytes) after verack does not want txs we KNOW are below that rate. We
+//    have no UTXO set, so a tx spending a confirmed output has an UNKNOWN rate;
+//    unknown is relayed (wallet sends, 0xD9 carriers, revocations and D23
+//    republishes must reach Core peers, which all send a nonzero filter). We
+//    receive feefilter only — we never send one.
 //  • Outbound redial after a drop: exponential backoff with jitter, capped,
 //    reset once a session stayed up long enough to count as healthy.
 #ifndef RELAY_POLICY_H
@@ -11,6 +17,28 @@
 #define REDIAL_BASE_S     15      // first retry (was the fixed now+15)
 #define REDIAL_CAP_S      1800    // 30 min ceiling
 #define REDIAL_HEALTHY_S  600     // a session up >= 10 min resets the backoff
+#define FEEFILTER_MAX     ((int64_t)1e17)  // > MAX_MONEY per kB: "relay nothing known"
+
+// parse a feefilter payload; returns the rate (>= 0) or -1 if malformed
+static inline int64_t feefilter_parse(const uint8_t *pl, size_t n) {
+    if (n != 8) return -1;
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; i--) v = (v << 8) | pl[i];
+    int64_t r = (int64_t)v;
+    if (r < 0) return -1;
+    return r > FEEFILTER_MAX ? FEEFILTER_MAX : r;
+}
+// koinu per 1000 bytes, rounded down; -1 if unknown
+static inline int64_t feerate_per_kb(int64_t fee, size_t len) {
+    if (fee < 0 || len == 0) return -1;
+    return (int64_t)(((__int128)fee * 1000) / (int64_t)len);
+}
+// may a tx with this rate (-1 = unknown) be relayed to a peer with this
+// filter? Only a rate KNOWN to be below the filter is held back.
+static inline int feefilter_allows(int64_t filter, int64_t rate) {
+    if (filter <= 0 || rate < 0) return 1;
+    return rate >= filter;
+}
 
 // delay before the next redial given consecutive failed/short sessions
 // (fails >= 1) and a random word; result in [base, base*1.25], <= cap*1.25

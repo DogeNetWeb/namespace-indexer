@@ -1569,6 +1569,8 @@ typedef struct {
                                       // (chain_topup) — released on dial failure so the
                                       // next tick tries a different candidate
     time_t up_at;                     // when this session came up (0 = never)
+    int64_t feefilter;                // peer's BIP133 feefilter (koinu/kB), 0 = none
+    int  got_verack;                  // handshake done: feefilter is honoured only after this
     int  redial_fails;                // consecutive short/failed sessions (backoff exponent)
 } SConn;
 static uint32_t redial_rnd(void) {
@@ -1596,7 +1598,7 @@ static void sconn_reset(SConn *c) {   // wipe transient state, keep outbound red
     c->outbound = ob; if (ob) { c->mesh_seat = ms; c->chain_seat = cs; memcpy(c->host, host, sizeof c->host); memcpy(c->hip, hip, sizeof c->hip); c->rport = rp;
         c->redial_fails = rf; c->redial_at = now + (time_t)redial_delay(rf, redial_rnd()); }
     else c->redial_fails = 0;
-    c->up_at = 0;
+    c->up_at = 0; c->feefilter = 0; c->got_verack = 0;
 }
 // close + notify the mesh (peer_down) if this was a live mesh peer
 static void serve_drop(SConn *c, const IdxMeshHooks *mesh) {
@@ -1822,6 +1824,12 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         }
     } else if (!strcmp(cmd, "verack")) {
         c->up = 1; if (!c->up_at) c->up_at = time(NULL);
+        c->got_verack = 1;
+    } else if (!strcmp(cmd, "feefilter")) {
+        // BIP133: don't inv/serve txs KNOWN to be below it. Only after the
+        // handshake (BIP133 says it is sent after verack); earlier ones are ignored.
+        int64_t ff = c->got_verack ? feefilter_parse(pl, pln) : -1;
+        if (ff >= 0) c->feefilter = ff;
     } else if (!strcmp(cmd, "dngetaddr")) {
         serve_send_dnaddr(c, coin, db, self, port);          // answer with our pepenet peers
     } else if (!strcmp(cmd, "dnaddr")) {
@@ -1904,6 +1912,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         uint32_t o = 0; uint64_t cnt = pl[o++];
         if (cnt == 0xFD) { if (pln < 3) return; cnt = pl[o] | (pl[o+1] << 8); o += 2; }
         else if (cnt >= 0xFE) return;
+        uint8_t *nf = NULL; uint32_t nfn = 0;               // held-back txs → notfound
         for (uint64_t i = 0; i < cnt && o + 36 <= pln; i++, o += 36) {
             uint32_t type = pl[o] | (pl[o+1]<<8) | (pl[o+2]<<16) | ((uint32_t)pl[o+3]<<24);
             if (type == 2 && ss) {                         // block (type 2) — from the serve store
@@ -1914,9 +1923,22 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
                 }
             } else if (type == 1) {                        // tx (type 1) — from the mempool
                 size_t rl; uint8_t *raw = mempool_get_copy(pl + o + 4, &rl);
-                if (raw) { net_send(c->fd, coin->magic, "tx", raw, (uint32_t)rl); free(raw); }
+                if (!raw) continue;
+                if (feefilter_allows(c->feefilter, mempool_feerate(pl + o + 4)))
+                    net_send(c->fd, coin->magic, "tx", raw, (uint32_t)rl);
+                else {                                     // known below its feefilter
+                    if (!nf) nf = malloc(9 + (size_t)(pln / 36 + 1) * 36);
+                    if (nf) { memcpy(nf + 9 + (size_t)nfn * 36, pl + o, 36); nfn++; }
+                }
+                free(raw);
             }
         }
+        if (nf && nfn) {
+            uint8_t vi[9]; int vo = 0; put_varint(vi, &vo, nfn);
+            memmove(nf + 9 - vo, vi, (size_t)vo);
+            net_send(c->fd, coin->magic, "notfound", nf + 9 - vo, (uint32_t)(vo + nfn * 36));
+        }
+        free(nf);
     } else if (!strcmp(cmd, "inv")) {
         // a peer advertises inventory. Tx invs (type 1) we don't have → pull
         // for the mempool. Block invs (type 2) we don't know → pull into the
@@ -1989,16 +2011,19 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         if (mempool_accept(pl, pln, txid, why, sizeof why)) {
             uint8_t inv[3 + 36]; int io = 0; put_varint(inv, &io, 1);
             inv[io++]=1; inv[io++]=0; inv[io++]=0; inv[io++]=0; memcpy(inv + io, txid, 32); io += 32;
+            int64_t fr = mempool_feerate(txid);
             for (int i = 0; i < SERVE_MAX_CONN; i++) {
                 SConn *o = &conns[i];
-                if (o->fd >= 0 && o->up && o != c) net_send(o->fd, o->magic ? o->magic : coin->magic, "inv", inv, (uint32_t)io);
+                if (o->fd >= 0 && o->up && o != c && feefilter_allows(o->feefilter, fr)) net_send(o->fd, o->magic ? o->magic : coin->magic, "inv", inv, (uint32_t)io);
             }
         }
     } else if (!strcmp(cmd, "mempool")) {
         // answer with an inv of our whole pool (BIP35). Bounded to one message.
         uint8_t (*ids)[32] = malloc(sizeof *ids * 1000);
         if (!ids) return;
-        size_t n = mempool_txids(ids, 1000);
+        size_t n0 = mempool_txids(ids, 1000), n = 0;
+        for (size_t i = 0; i < n0; i++)                      // BIP133: skip txs known below its filter
+            if (feefilter_allows(c->feefilter, mempool_feerate(ids[i]))) memmove(ids[n++], ids[i], 32);
         if (n) {
             uint8_t *inv = malloc(3 + n * 36);
             if (inv) { int io = 0; put_varint(inv, &io, (uint64_t)n);
@@ -2426,7 +2451,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                     c->redial_fails = redial_next_fails(c->redial_fails, -1);   // configured peer: keep trying, backed off
                     c->redial_at = now + (time_t)redial_delay(c->redial_fails, redial_rnd()); continue;
                 }
-                c->fd = fd; c->up = 1; c->up_at = now; c->sent_ver = 1; c->magic = coin->magic;
+                c->fd = fd; c->up = 1; c->up_at = now; c->got_verack = 1; c->sent_ver = 1; c->magic = coin->magic;
                 c->last_rx = now; c->last_ping = 0; c->peer_h = ph;
                 // record the CONNECTED remote addr — the addr book stays numeric,
                 // and the seat identity snaps to where the socket actually landed

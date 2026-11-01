@@ -118,6 +118,7 @@ check: test_db test_sync test_codec test_serve test_reorg test_rollback test_rel
 	@rc=0; for t in ./test_db ./test_sync ./test_codec ./test_serve ./test_reorg ./test_rollback ./test_relay; do \
 	  echo "=== $$t ==="; $$t || rc=1; done; \
 	echo "=== scripts/test_peer_height.py ==="; python3 scripts/test_peer_height.py ./indexerd || rc=1; \
+	echo "=== scripts/test_feefilter.py ==="; python3 scripts/test_feefilter.py ./indexerd || rc=1; \
 	echo "=== scripts/test_redial.py ==="; python3 scripts/test_redial.py ./indexerd || rc=1; \
 	if [ $$rc -eq 0 ]; then echo "check: ALL PASSED"; else echo "check: FAILED"; fi; exit $$rc
 
