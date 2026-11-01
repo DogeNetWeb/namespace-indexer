@@ -1,7 +1,12 @@
 #!/bin/sh
 # repro-build.sh — reviewer-reproducible static dnsd from CLEAN git archives.
 #
-#   scripts/repro-build.sh <indexer-commit> [workdir]
+#   scripts/repro-build.sh [--allow-pre-rl] <indexer-commit> [workdir]
+#
+# dogenet-dns base: DNS_REV, default 72429c7 (the live rate-limiter base).
+# The build REFUSES a DNS_REV that lacks the dns_net rate limiter commits
+# d8dc8a6, 0056c3c and 72429c7 (e.g. the old 93b52ba snapshot) unless
+# --allow-pre-rl is given — a pre-limiter dnsd must never be deployed.
 #
 # Inputs (env, defaults are the rl-recover layout; repos are only READ via
 # `git archive`, never checked out or modified):
@@ -11,7 +16,7 @@
 #   SECP_GIT=$REPOS/namespace-indexer/vendor/secp256k1  (the submodule pin is
 #                                      read from <indexer-commit>'s tree)
 #   AM=/workspace/rl-recover/sqlite-amalgamation-3540100
-#   DNS_REV=93b52ba MESH_REV=d683004 PROTO_REV=b2f90b5
+#   DNS_REV=72429c7 MESH_REV=d683004 PROTO_REV=b2f90b5
 # Same flags as rl-recover/BUILD.sh (sqlite opts, -O2 -Wall -Wextra -Wshadow,
 # -static). Path independence: everything is unpacked under <workdir>
 # (default: a fresh mktemp dir) and compiled with -ffile-prefix-map=<workdir>=/build
@@ -19,12 +24,26 @@
 # Untracked files in a working copy can never leak in (git archive only).
 # Prints the sha256 of <workdir>/out/dnsd as the last line.
 set -eu
-REV=${1:?usage: repro-build.sh <indexer-commit> [workdir]}
+ALLOW_PRE_RL=0
+if [ "${1:-}" = --allow-pre-rl ]; then ALLOW_PRE_RL=1; shift; fi
+REV=${1:?usage: repro-build.sh [--allow-pre-rl] <indexer-commit> [workdir]}
 REPOS=${REPOS:-/workspace/rl-recover/b}
 INDEXER_GIT=${INDEXER_GIT:-$REPOS/namespace-indexer}
 SECP_GIT=${SECP_GIT:-$REPOS/namespace-indexer/vendor/secp256k1}
 AM=${AM:-/workspace/rl-recover/sqlite-amalgamation-3540100}
-DNS_REV=${DNS_REV:-93b52ba} MESH_REV=${MESH_REV:-d683004} PROTO_REV=${PROTO_REV:-b2f90b5}
+DNS_REV=${DNS_REV:-72429c7} MESH_REV=${MESH_REV:-d683004} PROTO_REV=${PROTO_REV:-b2f90b5}
+missing=""
+for c in d8dc8a6 0056c3c 72429c7; do
+    git -C "$REPOS/dogenet-dns" merge-base --is-ancestor "$c" "$DNS_REV" 2>/dev/null || missing="$missing $c"
+done
+if [ -n "$missing" ]; then
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+    echo "!! dogenet-dns $DNS_REV LACKS the rate limiter:$missing" >&2
+    echo "!! (live base is 72429c7). This dnsd must not be deployed." >&2
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+    [ "$ALLOW_PRE_RL" = 1 ] || { echo "refusing to build; pass --allow-pre-rl to override" >&2; exit 3; }
+    echo "--allow-pre-rl given: building anyway (NOT deployable)" >&2
+fi
 W=${2:-$(mktemp -d)}; mkdir -p "$W"; W=$(cd "$W" && pwd -P)
 [ -z "$(ls -A "$W")" ] || { echo "workdir $W not empty" >&2; exit 2; }
 export LC_ALL=C TZ=UTC SOURCE_DATE_EPOCH=0; umask 022
