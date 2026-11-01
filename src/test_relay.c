@@ -2,6 +2,7 @@
 // redial backoff (pure helpers + mempool; the wire paths are scripts/test_*.py).
 #include "relay_policy.h"
 #include "mempool.h"
+#include "txcheck.h"
 #include "chain.h"
 #include <stdio.h>
 #include <string.h>
@@ -96,6 +97,40 @@ int main(void) {
     CK(mempool_accept(ch, cn, cid, why, sizeof why), "4-input child accepted");
     CK(mempool_feerate(cid) == feerate_per_kb(5000, cn), "4-input child rate from the parent's stored outputs");
     mempool_reset();
+
+    // input sum past TX_MAX_MONEY (19 pooled parents x 1e18): -1, never an int64 wrap
+    {
+        static uint8_t big[20 + 19 * 41 + 64]; uint8_t pids[19][32]; int okp = 1;
+        for (int k = 0; k < 19; k++) {
+            uint8_t e2[32]; memset(e2, 0x40 + k, 32);
+            pn = mktx(p, e2, TX_MAX_MONEY);
+            okp &= mempool_accept(p, pn, pids[k], why, sizeof why);
+        }
+        if (!okp) printf("     1e18 parent reject: %s\n", why);
+        CK(okp, "19 parents with a TX_MAX_MONEY output each accepted");
+        size_t o = 0;
+        le(big + o, 1, 4); o += 4; big[o++] = 19;
+        for (int k = 0; k < 19; k++) {
+            memcpy(big + o, pids[k], 32); o += 32; le(big + o, 0, 4); o += 4;
+            big[o++] = 1; big[o++] = 0x51; le(big + o, 0xffffffff, 4); o += 4;
+        }
+        big[o++] = 1; le(big + o, 100000000, 8); o += 8;
+        big[o++] = 25; big[o++] = 0x76; big[o++] = 0xa9; big[o++] = 20; memset(big + o, 0x11, 20); o += 20; big[o++] = 0x88; big[o++] = 0xac;
+        le(big + o, 0, 4); o += 4;
+        int okc = mempool_accept(big, o, cid, why, sizeof why);
+        if (!okc) printf("     19-input child reject: %s\n", why);
+        CK(okc, "19-input child accepted");
+        CK(mempool_feerate(cid) == -1, "input sum > TX_MAX_MONEY -> rate unknown (-1), no overflow");
+        mempool_reset();
+    }
+
+    // pool byte accounting: raw length + 8 bytes per stored output value
+    CK(mempool_bytes() == 0, "empty pool counts 0 bytes");
+    fnn = mkfan(fan, ext);
+    CK(mempool_accept(fan, fnn, fid, why, sizeof why), "fan-out parent accepted (byte cap)");
+    CK(mempool_bytes() == fnn + 4 * 8, "pool cap counts len + 8*nout");
+    mempool_reset();
+    CK(mempool_bytes() == 0, "reset clears the byte count");
 
     // redial backoff
     CK(redial_delay(1, 0) == REDIAL_BASE_S, "first redial = base 15 s (old behaviour)");

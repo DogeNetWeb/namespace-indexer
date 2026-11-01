@@ -47,6 +47,8 @@ void mempool_on_confirmed_tx(const uint8_t txid[32], const IdxTx *tx);
 void mempool_sweep(int64_t now);
 
 int    mempool_count(void);
+// Bytes counted against MEMPOOL_MAX_BYTES: each entry's raw length + 8 per output.
+size_t mempool_bytes(void);
 // Copy up to `max` txids out (for answering a `mempool` message / tests).
 size_t mempool_txids(uint8_t (*out)[32], size_t max);
 // Iterate every pooled tx under the lock — cb must not call back into mempool.

@@ -68,7 +68,10 @@ s = sqlite3.connect(os.path.join(d, 'serve-doge.db'))
 s.executescript("CREATE TABLE headers(height INTEGER PRIMARY KEY, hash BLOB, hdr BLOB);"
                 "CREATE INDEX headers_hash ON headers(hash);"); s.commit(); s.close()
 port = 22000 + os.getpid() % 2000
-p = subprocess.Popen([IDX, 'serve', 'doge', db, str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+lst = socket.socket(); lst.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+lst.bind(('127.0.0.2', 0)); lst.listen(4); lst.settimeout(30)
+p = subprocess.Popen([IDX, 'serve', 'doge', db, str(port), '127.0.0.2:%d' % lst.getsockname()[1]],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 try:
     for _ in range(50):
         try: socket.create_connection(('127.0.0.1', port), timeout=1).close(); break
@@ -105,6 +108,20 @@ try:
     B.send('tx', par); B.sync(); A.invs()
     A.send('mempool'); m = A.invs()
     ck(pid in m and oid not in m, 'orphan child recomputed to known-low once its parent arrives')
+    # 5. OUTBOUND session (we dialed a configured peer): a feefilter sent before
+    # its verack is ignored; one after verack is honoured (got_verack is set from
+    # the verack that actually arrived in serve_dial's handshake)
+    o, _ = lst.accept(); o.settimeout(5)
+    while recv_cmd(o)[0] != 'version': pass
+    o.sendall(msg('version', version(0)) + msg('feefilter', struct.pack('<q', 50000000)) + msg('verack'))
+    class _O(Peer):
+        def __init__(self, s): self.s = s
+    F = _O(o); F.sync()
+    F.send('mempool'); m = F.invs()
+    ck(lid in m, 'outbound: feefilter before verack ignored (known-low child listed)')
+    F.send('feefilter', struct.pack('<q', 50000000)); F.sync()
+    F.send('mempool'); m = F.invs()
+    ck(cid in m and lid not in m, 'outbound: feefilter after verack honoured (known-low child filtered)')
 finally:
     p.terminate(); p.wait(5)
 sys.exit(1 if fails else 0)

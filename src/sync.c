@@ -2044,7 +2044,8 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
 static int serve_dial(const char *host, uint16_t port, const Coin *coin,
                       int64_t services, int64_t our_h, char agent_out[128],
                       int64_t *services_out, char self[80], uint16_t lport,
-                      int64_t *height_out) {
+                      int64_t *height_out, int *verack_out) {
+    if (verack_out) *verack_out = 0;
     int fd = net_connect(host, port);
     if (fd < 0) return -1;
     serve_send_version(fd, coin, our_h, services);
@@ -2079,7 +2080,7 @@ static int serve_dial(const char *host, uint16_t port, const Coin *coin,
         free(pl);
     }
     if (is_self) { close(fd); return -2; }    // dialed ourselves — tell the caller to drop this peer
-    if (gv && gvk) return fd;
+    if (gv && gvk) { if (verack_out) *verack_out = gvk; return fd; }   // the peer's verack really arrived
     close(fd); return -1;
 }
 
@@ -2425,9 +2426,9 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                     if (!c->chain_seat) idx_self_seed = 1;   // a looping configured seed = we ARE the seed
                     c->outbound = 0; c->mesh_seat = 0; c->chain_seat = 0; c->host[0] = 0; c->hip[0] = 0; continue;
                 }
-                char agent[128]; int64_t psvc = 0, ph = 0;
+                char agent[128]; int64_t psvc = 0, ph = 0; int gvk = 0;
                 int fd = serve_dial(c->hip, c->rport, coin, services, our_h, agent, &psvc,
-                                    self, port, &ph);
+                                    self, port, &ph, &gvk);
                 if (fd == -2) {   // handshake proved the peer is us — drop it for good
                     fprintf(stderr, "serve: %s:%u is ourselves (self-connect) — dropping self-seed\n", c->host, c->rport);
                     if (!c->chain_seat) idx_self_seed = 1;
@@ -2451,7 +2452,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                     c->redial_fails = redial_next_fails(c->redial_fails, -1);   // configured peer: keep trying, backed off
                     c->redial_at = now + (time_t)redial_delay(c->redial_fails, redial_rnd()); continue;
                 }
-                c->fd = fd; c->up = 1; c->up_at = now; c->got_verack = 1; c->sent_ver = 1; c->magic = coin->magic;
+                c->fd = fd; c->up = 1; c->up_at = now; c->got_verack = gvk; c->sent_ver = 1; c->magic = coin->magic;
                 c->last_rx = now; c->last_ping = 0; c->peer_h = ph;
                 // record the CONNECTED remote addr — the addr book stays numeric,
                 // and the seat identity snaps to where the socket actually landed

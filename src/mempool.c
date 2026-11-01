@@ -58,6 +58,9 @@ static MpEntry *prevout_owner(const uint8_t prevout[36]) {
     return NULL;
 }
 
+// bytes an entry counts against MEMPOOL_MAX_BYTES: raw tx + its stored output values
+static size_t entry_cost(size_t len, int nout) { return len + (size_t)nout * sizeof(int64_t); }
+
 // caller holds g_mu. Fee rate from pooled parents' stored output values (no
 // UTXO set, no re-parse): O(n_in) hash lookups. Any input whose parent is not
 // pooled makes the rate unknown (-1) — unknown is relayed, see relay_policy.h.
@@ -68,7 +71,8 @@ static int64_t entry_feerate_locked(const MpEntry *e) {
         uint32_t vout = po[32] | (po[33] << 8) | (po[34] << 16) | ((uint32_t)po[35] << 24);
         MpEntry *pe = find_entry(po);
         if (!pe || vout >= (uint32_t)pe->nout) return -1;
-        in += pe->outv[vout];
+        in += pe->outv[vout];            // each outv <= TX_MAX_MONEY: no overflow before the check
+        if (in > TX_MAX_MONEY) return -1;   // impossible on-chain; never wrap int64
     }
     if (in < e->outsum) return -1;
     return feerate_per_kb(in - e->outsum, e->len);
@@ -96,7 +100,7 @@ static void remove_entry(MpEntry *e) {
                 MpPrev *dead = *pp; *pp = dead->hnext; free(dead); break;
             }
     }
-    g_count--; g_bytes -= e->len;
+    g_count--; g_bytes -= entry_cost(e->len, e->nout);
     free(e->outv); free(e->prev); free(e->raw); free(e);
 }
 
@@ -158,7 +162,7 @@ int mempool_accept(const uint8_t *raw, size_t len, uint8_t txid_out[32],
         if (prevout_owner(tx.ins[i].prevout)) { pthread_mutex_unlock(&g_mu); idx_tx_free(&tx);
             if (reason && rc) snprintf(reason, rc, "conflicting input (double-spend)"); return 0; }
 
-    while (g_count >= MEMPOOL_MAX_TXS || g_bytes + len > MEMPOOL_MAX_BYTES) {
+    while (g_count >= MEMPOOL_MAX_TXS || g_bytes + entry_cost(len, tx.n_out) > MEMPOOL_MAX_BYTES) {
         if (!g_count) break;                    // len alone exceeds the byte cap — shouldn't happen (≤100KB)
         evict_oldest();
     }
@@ -187,7 +191,7 @@ int mempool_accept(const uint8_t *raw, size_t len, uint8_t txid_out[32],
         memcpy(pn->prevout, e->prev[i], 36); pn->e = e;
         unsigned pb = pv_h(e->prev[i]); pn->hnext = g_pbucket[pb]; g_pbucket[pb] = pn;
     }
-    g_count++; g_bytes += len;
+    g_count++; g_bytes += entry_cost(len, e->nout);
     refresh_children_locked(e);
     pthread_mutex_unlock(&g_mu);
     idx_tx_free(&tx);
@@ -253,6 +257,7 @@ void mempool_sweep(int64_t now) {
 }
 
 int mempool_count(void) { return g_count; }
+size_t mempool_bytes(void) { pthread_mutex_lock(&g_mu); size_t b = g_bytes; pthread_mutex_unlock(&g_mu); return b; }
 
 size_t mempool_txids(uint8_t (*out)[32], size_t max) {
     size_t n = 0;
