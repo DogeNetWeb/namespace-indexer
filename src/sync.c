@@ -2104,6 +2104,13 @@ static int conn_host_live(SConn *conns, const SConn *except, const char *host) {
             char *col = strrchr(ip, ':'); if (col) *col = 0;
             if (!strcmp(ip, host)) return 1;
         }
+        // two DISCONNECTED configured seats for one peer (a --peer plus the
+        // same addr re-listed from the peers table, or a hostname seed and
+        // its numeric row) must not park each other forever: the lower slot
+        // owns the dial, the higher one parks behind it.
+        if (c->fd < 0 && c->outbound && except && except->outbound &&
+            !c->mesh_seat && !c->chain_seat && !except->mesh_seat && !except->chain_seat &&
+            c > except) continue;
         if (c->fd < 0 && c->outbound &&
             ((c->hip[0]  && !strcmp(c->hip,  host)) ||
              (c->host[0] && !strcmp(c->host, host)))) return 1;
@@ -2269,6 +2276,10 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
         for (char *sv, *t = strtok_r(list, ",", &sv); t && slot < SERVE_MAX_CONN; t = strtok_r(NULL, ",", &sv)) {
             char host[80]; uint16_t rp;
             peer_split(t, host, sizeof host, &rp, coin->port);
+            int dup = 0;   // the embedder may list one addr twice (--peer + peers table)
+            for (int j = 0; j < slot; j++)
+                if (conns[j].rport == rp && !strcmp(conns[j].host, host)) dup = 1;
+            if (dup) continue;
             conns[slot].outbound = 1; seat_point(&conns[slot], host, rp); slot++;
         }
     }
