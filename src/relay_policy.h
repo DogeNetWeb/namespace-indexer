@@ -15,7 +15,7 @@
 #include <stddef.h>
 
 #define REDIAL_BASE_S     15      // first retry (was the fixed now+15)
-#define REDIAL_CAP_S      1800    // 30 min ceiling
+#define REDIAL_CAP_S      1800    // 30 min ceiling before jitter; +0..25% jitter => worst case 2250 s (~37.5 min)
 #define REDIAL_HEALTHY_S  600     // a session up >= 10 min resets the backoff
 #define FEEFILTER_MAX     ((int64_t)1e17)  // > MAX_MONEY per kB: "relay nothing known"
 
