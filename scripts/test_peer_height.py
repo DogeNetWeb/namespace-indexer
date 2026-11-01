@@ -7,6 +7,9 @@ import hashlib, os, socket, sqlite3, struct, subprocess, sys, tempfile, time
 IDX = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), '..', 'indexerd')
 MAGIC = bytes([0xC0, 0xC0, 0xC0, 0xC0])
 fails = 0
+# under `unshare -rn` the fresh netns has lo DOWN — bring it up (no-op/harmless
+# elsewhere; needs CAP_NET_ADMIN in the netns, which unshare -r grants)
+subprocess.call(['ip', 'link', 'set', 'lo', 'up'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 def ck(c, n):
     global fails
     print(('ok   ' if c else 'FAIL ') + n); fails += 0 if c else 1
