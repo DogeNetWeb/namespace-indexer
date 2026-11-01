@@ -1,0 +1,80 @@
+// test_relay.c — BIP133 feefilter relay policy + outbound redial backoff.
+#include "relay_policy.h"
+#include "mempool.h"
+#include "chain.h"
+#include <stdio.h>
+#include <string.h>
+
+static int fails;
+#define CK(c, m) do { if (c) printf("ok   %s\n", m); else { printf("FAIL %s\n", m); fails++; } } while (0)
+
+static void le(uint8_t *p, uint64_t v, int n) { for (int i = 0; i < n; i++) p[i] = (uint8_t)(v >> (8 * i)); }
+// 1-in 1-out legacy tx, P2PKH-shaped output, a dummy 1-byte scriptSig
+static size_t mktx(uint8_t *b, const uint8_t prev[32], uint32_t vout, int64_t value) {
+    size_t o = 0;
+    le(b + o, 1, 4); o += 4; b[o++] = 1;
+    memcpy(b + o, prev, 32); o += 32; le(b + o, vout, 4); o += 4;
+    b[o++] = 1; b[o++] = 0x51;                       // scriptSig: OP_TRUE
+    le(b + o, 0xffffffff, 4); o += 4; b[o++] = 1;
+    le(b + o, (uint64_t)value, 8); o += 8;
+    b[o++] = 25; b[o++] = 0x76; b[o++] = 0xa9; b[o++] = 20; memset(b + o, 0x11, 20); o += 20; b[o++] = 0x88; b[o++] = 0xac;
+    le(b + o, 0, 4); o += 4;
+    return o;
+}
+
+int main(void) {
+    // feefilter payload parsing
+    uint8_t pl[8]; le(pl, 50000000, 8);
+    CK(feefilter_parse(pl, 8) == 50000000, "feefilter 50M koinu/kB parses (192.0.2.1's value)");
+    CK(feefilter_parse(pl, 7) == -1, "short feefilter payload rejected");
+    le(pl, 0x8000000000000000ull, 8);
+    CK(feefilter_parse(pl, 8) == -1, "negative feefilter rejected");
+    le(pl, 0x7fffffffffffffffull, 8);
+    CK(feefilter_parse(pl, 8) == FEEFILTER_MAX, "huge feefilter clamps (relay nothing)");
+    CK(feerate_per_kb(1000, 250) == 4000, "fee 1000 over 250 B = 4000/kB");
+    CK(feerate_per_kb(-1, 250) == -1, "unknown fee → unknown rate");
+    CK(feefilter_allows(0, -1), "no filter: relay anything, even unknown-fee txs");
+    CK(!feefilter_allows(1000, -1), "filter set: unknown-fee tx is not relayed");
+    CK(feefilter_allows(1000, 1000), "rate == filter relayed");
+    CK(!feefilter_allows(1000, 999), "rate below filter not relayed");
+
+    // mempool fee rate: known only from in-pool parents
+    mempool_reset();
+    uint8_t ext[32]; memset(ext, 0xab, 32);
+    uint8_t p[256], ch[256], pid[32], cid[32]; char why[128];
+    size_t pn = mktx(p, ext, 0, 100000000);
+    int ap = mempool_accept(p, pn, pid, why, sizeof why);
+    if (!ap) printf("     parent reject: %s\n", why);
+    CK(ap, "parent accepted");
+    CK(mempool_feerate(pid) == -1, "parent spends an outpoint not in the pool → rate unknown");
+    size_t cn = mktx(ch, pid, 0, 100000000 - 1000);
+    int ac = mempool_accept(ch, cn, cid, why, sizeof why);
+    if (!ac) printf("     child reject: %s\n", why);
+    CK(ac, "child accepted");
+    int64_t want = feerate_per_kb(1000, cn);
+    CK(mempool_feerate(cid) == want, "child rate = (in − out)·1000/len from the pooled parent");
+    CK(!feefilter_allows(50000000, mempool_feerate(cid)), "child below a 50M/kB filter → withheld from that peer");
+    CK(feefilter_allows(want, mempool_feerate(cid)), "child at the peer's filter → relayed");
+    uint8_t none[32]; memset(none, 0xcd, 32);
+    CK(mempool_feerate(none) == -1, "tx not in pool → unknown");
+    mempool_reset();
+
+    // redial backoff
+    CK(redial_delay(1, 0) == REDIAL_BASE_S, "first redial = base 15 s (old behaviour)");
+    CK(redial_delay(2, 0) == 30 && redial_delay(3, 0) == 60, "doubles per short session");
+    CK(redial_delay(30, 0) == REDIAL_CAP_S, "capped at 1800 s");
+    int jit_ok = 1;
+    for (uint32_t r = 0; r < 5000; r += 7) { uint32_t d = redial_delay(4, r * 2654435761u); if (d < 120 || d > 150) jit_ok = 0; }
+    CK(jit_ok, "jitter stays within [d, 1.25·d]");
+    CK(redial_delay(30, 0xffffffffu) <= REDIAL_CAP_S + REDIAL_CAP_S / 4, "jittered cap bounded");
+    int f = 0;
+    for (int i = 0; i < 4; i++) f = redial_next_fails(f, 120);   // evicted after 2 min, 4 times
+    CK(f == 4 && redial_delay(f, 0) == 120, "4 short sessions → 120 s");
+    CK(redial_next_fails(f, -1) == 5, "dial/handshake failure counts as a failed session");
+    CK(redial_next_fails(f, REDIAL_HEALTHY_S) == 1, "healthy session resets to base");
+    f = 0; for (int i = 0; i < 1000; i++) f = redial_next_fails(f, 0);
+    CK(f == 30 && redial_delay(f, 0) == REDIAL_CAP_S, "exponent saturates (no overflow)");
+
+    printf("test_relay: %s (%d failure%s)\n", fails ? "FAILED" : "ALL PASSED", fails, fails == 1 ? "" : "s");
+    return fails != 0;
+}

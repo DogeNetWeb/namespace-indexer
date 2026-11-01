@@ -1,6 +1,7 @@
 // mempool.c — see mempool.h. Two chained hash tables (by txid, by prevout) over
 // a shared set of entries, one mutex, static zero-initialized state.
 #include "mempool.h"
+#include "relay_policy.h"
 #include "txcheck.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,7 @@ typedef struct MpEntry {
     uint8_t  txid[32];
     uint8_t *raw; size_t len;
     int64_t  added;
+    int64_t  feerate;                 // koinu/kB, -1 unknown (inputs not all in pool)
     uint8_t (*prev)[36]; int nprev;
     struct MpEntry *hnext;            // txid bucket chain
 } MpEntry;
@@ -43,6 +45,26 @@ static unsigned pv_h(const uint8_t p[36]) {
     return h & MP_MASK;
 }
 
+static MpEntry *find_entry(const uint8_t txid[32]);
+// fee rate from in-pool parents only (no utxo lookups: small footprint). Any
+// input whose parent is not pooled makes the rate unknown (-1).
+static int64_t pool_feerate_locked(const IdxTx *tx, size_t len) {
+    int64_t in = 0, out = 0;
+    for (int i = 0; i < tx->n_in; i++) {
+        const uint8_t *po = tx->ins[i].prevout;
+        uint32_t vout = po[32] | (po[33] << 8) | (po[34] << 16) | ((uint32_t)po[35] << 24);
+        MpEntry *pe = find_entry(po);
+        if (!pe) return -1;
+        IdxTx pt; if (!idx_tx_parse(pe->raw, pe->len, &pt)) return -1;
+        int64_t v = vout < (uint32_t)pt.n_out ? pt.outs[vout].value : -1;
+        idx_tx_free(&pt);
+        if (v < 0) return -1;
+        in += v;
+    }
+    for (int k = 0; k < tx->n_out; k++) out += tx->outs[k].value;
+    if (in < out) return -1;
+    return feerate_per_kb(in - out, len);
+}
 static MpEntry *find_entry(const uint8_t txid[32]) {
     for (MpEntry *e = g_tbucket[tx_h(txid)]; e; e = e->hnext)
         if (!memcmp(e->txid, txid, 32)) return e;
@@ -143,6 +165,7 @@ int mempool_accept(const uint8_t *raw, size_t len, uint8_t txid_out[32],
     memcpy(e->txid, tx.txid, 32);
     memcpy(rawcopy, raw, len); e->raw = rawcopy; e->len = len;
     e->added = (int64_t)time(NULL);
+    e->feerate = pool_feerate_locked(&tx, len);
     e->nprev = tx.n_in; e->prev = prev;
     for (int i = 0; i < tx.n_in; i++) memcpy(e->prev[i], tx.ins[i].prevout, 36);
     // link into txid + prevout tables
@@ -159,6 +182,12 @@ int mempool_accept(const uint8_t *raw, size_t len, uint8_t txid_out[32],
     return 1;
 }
 
+int64_t mempool_feerate(const uint8_t txid[32]) {
+    pthread_mutex_lock(&g_mu);
+    MpEntry *e = find_entry(txid); int64_t r = e ? e->feerate : -1;
+    pthread_mutex_unlock(&g_mu);
+    return r;
+}
 int mempool_has(const uint8_t txid[32]) {
     pthread_mutex_lock(&g_mu);
     int r = find_entry(txid) != NULL;

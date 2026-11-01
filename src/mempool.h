@@ -26,6 +26,9 @@ int  mempool_accept(const uint8_t *raw, size_t len, uint8_t txid_out[32],
                     char *reason, size_t reason_cap);
 
 int  mempool_has(const uint8_t txid[32]);
+// Fee rate (koinu per 1000 bytes) of a pooled tx, or -1 if unknown/not pooled.
+// Known only when every input spends an output of a tx also in the pool.
+int64_t mempool_feerate(const uint8_t txid[32]);
 // Malloc a copy of the stored tx bytes for `txid` (caller frees), or NULL.
 uint8_t *mempool_get_copy(const uint8_t txid[32], size_t *len_out);
 

@@ -103,18 +103,21 @@ test_rollback: $(TEST_SRCS) src/test_rollback.c $(SECPLIB)
 # getdata cache + the blockstage mailbox — which no other suite touches. It
 # needs only serve_store.c and sqlite, so it links its own tiny composition
 # rather than the full indexer object set.
+test_relay: $(TEST_SRCS) src/test_relay.c src/relay_policy.h $(SECPLIB)
+	$(CC) $(CFLAGS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ $(TEST_SRCS) src/test_relay.c $(LIBS)
+
 test_serve: src/test_serve.c src/serve_store.c src/serve_store.h
 	$(CC) $(CFLAGS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ src/test_serve.c src/serve_store.c $(SQLITE_LIBS)
 
-# `make check` = the six suites. Run `make test` for the shipped selftest.
+# `make check` = the seven suites. Run `make test` for the shipped selftest.
 # Every suite runs even if an earlier one fails; the target fails if any did.
-check: test_db test_sync test_codec test_serve test_reorg test_rollback indexerd
-	@rc=0; for t in ./test_db ./test_sync ./test_codec ./test_serve ./test_reorg ./test_rollback; do \
+check: test_db test_sync test_codec test_serve test_reorg test_rollback test_relay indexerd
+	@rc=0; for t in ./test_db ./test_sync ./test_codec ./test_serve ./test_reorg ./test_rollback ./test_relay; do \
 	  echo "=== $$t ==="; $$t || rc=1; done; \
 	echo "=== scripts/test_peer_height.py ==="; python3 scripts/test_peer_height.py ./indexerd || rc=1; \
 	if [ $$rc -eq 0 ]; then echo "check: ALL PASSED"; else echo "check: FAILED"; fi; exit $$rc
 
 check-clean:
-	rm -f test_db test_sync test_codec test_serve test_reorg test_rollback
+	rm -f test_db test_sync test_codec test_serve test_reorg test_rollback test_relay
 
 .PHONY: check check-clean

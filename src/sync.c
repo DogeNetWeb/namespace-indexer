@@ -12,6 +12,7 @@
 #include "pow.h"
 #include "serve_store.h"
 #include "mempool.h"
+#include "relay_policy.h"
 #include "txcheck.h"
 #include "sm.h"
 #include <stdio.h>
@@ -1567,7 +1568,15 @@ typedef struct {
     int  chain_seat;                  // outbound slot seated by addrman-style selection
                                       // (chain_topup) — released on dial failure so the
                                       // next tick tries a different candidate
+    int64_t feefilter;                // peer's BIP133 feefilter (koinu/kB), 0 = none
+    time_t up_at;                     // when this session came up (0 = never)
+    int  redial_fails;                // consecutive short/failed sessions (backoff exponent)
 } SConn;
+static uint32_t redial_rnd(void) {
+    uint32_t r = 0;
+    if (getrandom(&r, sizeof r, GRND_NONBLOCK) != (ssize_t)sizeof r) r = (uint32_t)time(NULL) * 2654435761u;
+    return r;
+}
 // the mesh send fn handed to peer_up: emit a dn* command on this peer's conn
 static void serve_mesh_send(void *peer, const char *cmd, const uint8_t *pay, size_t n) {
     SConn *sc = (SConn *)peer;
@@ -1576,11 +1585,19 @@ static void serve_mesh_send(void *peer, const char *cmd, const uint8_t *pay, siz
 static void sconn_reset(SConn *c) {   // wipe transient state, keep outbound redial info
     free(c->buf);
     int ob = c->outbound, ms = c->mesh_seat, cs = c->chain_seat; char host[80], hip[46]; uint16_t rp = c->rport;
+    time_t now = time(NULL);
+    // backoff: a session that never came up or died young grows the delay;
+    // one that stayed up REDIAL_HEALTHY_S resets it (a peer evicting us, e.g.
+    // Core's 0x42 rate-limit + FIN, no longer gets redialled every 15 s)
+    int rf = ob ? redial_next_fails(c->redial_fails, c->up_at ? (long)(now - c->up_at) : -1L) : 0;
     memcpy(host, c->host, sizeof host); memcpy(hip, c->hip, sizeof hip);
     c->fd = -1; c->buf = NULL; c->len = c->cap = 0; c->up = c->sent_ver = 0;
     c->peer[0] = 0; c->agent[0] = 0; c->hip[0] = 0; c->peer_h = 0; c->mesh_handle = NULL; c->dn_asked = 0; c->mesh_seat = 0;
     c->self_sent = 0; c->chain_seat = 0; c->last_rx = 0; c->last_ping = 0; c->last_pull = 0;
-    c->outbound = ob; if (ob) { c->mesh_seat = ms; c->chain_seat = cs; memcpy(c->host, host, sizeof c->host); memcpy(c->hip, hip, sizeof c->hip); c->rport = rp; c->redial_at = time(NULL) + 15; }
+    c->outbound = ob; if (ob) { c->mesh_seat = ms; c->chain_seat = cs; memcpy(c->host, host, sizeof c->host); memcpy(c->hip, hip, sizeof c->hip); c->rport = rp;
+        c->redial_fails = rf; c->redial_at = now + (time_t)redial_delay(rf, redial_rnd()); }
+    else c->redial_fails = 0;
+    c->feefilter = 0; c->up_at = 0;
 }
 // close + notify the mesh (peer_down) if this was a live mesh peer
 static void serve_drop(SConn *c, const IdxMeshHooks *mesh) {
@@ -1789,7 +1806,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
             c->sent_ver = 1;
         }
         net_send(c->fd, coin->magic, "verack", NULL, 0);
-        c->up = 1;
+        c->up = 1; if (!c->up_at) c->up_at = time(NULL);
         // a marked peer + a mesh embedder → hand it up so the carrier gossips
         if (mesh && mesh->peer_up && !c->mesh_handle && AGENT_MARKED(c->agent))
             c->mesh_handle = mesh->peer_up(mesh->ud, c, serve_mesh_send);
@@ -1805,7 +1822,10 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
             c->self_sent = 1;
         }
     } else if (!strcmp(cmd, "verack")) {
-        c->up = 1;
+        c->up = 1; if (!c->up_at) c->up_at = time(NULL);
+    } else if (!strcmp(cmd, "feefilter")) {
+        int64_t ff = feefilter_parse(pl, pln);                // BIP133: don't relay below it
+        if (ff >= 0) c->feefilter = ff;
     } else if (!strcmp(cmd, "dngetaddr")) {
         serve_send_dnaddr(c, coin, db, self, port);          // answer with our pepenet peers
     } else if (!strcmp(cmd, "dnaddr")) {
@@ -1898,7 +1918,9 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
                 }
             } else if (type == 1) {                        // tx (type 1) — from the mempool
                 size_t rl; uint8_t *raw = mempool_get_copy(pl + o + 4, &rl);
-                if (raw) { net_send(c->fd, coin->magic, "tx", raw, (uint32_t)rl); free(raw); }
+                if (raw && feefilter_allows(c->feefilter, mempool_feerate(pl + o + 4)))
+                    net_send(c->fd, coin->magic, "tx", raw, (uint32_t)rl);
+                free(raw);
             }
         }
     } else if (!strcmp(cmd, "inv")) {
@@ -1973,16 +1995,19 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         if (mempool_accept(pl, pln, txid, why, sizeof why)) {
             uint8_t inv[3 + 36]; int io = 0; put_varint(inv, &io, 1);
             inv[io++]=1; inv[io++]=0; inv[io++]=0; inv[io++]=0; memcpy(inv + io, txid, 32); io += 32;
+            int64_t fr = mempool_feerate(txid);
             for (int i = 0; i < SERVE_MAX_CONN; i++) {
                 SConn *o = &conns[i];
-                if (o->fd >= 0 && o->up && o != c) net_send(o->fd, o->magic ? o->magic : coin->magic, "inv", inv, (uint32_t)io);
+                if (o->fd >= 0 && o->up && o != c && feefilter_allows(o->feefilter, fr)) net_send(o->fd, o->magic ? o->magic : coin->magic, "inv", inv, (uint32_t)io);
             }
         }
     } else if (!strcmp(cmd, "mempool")) {
         // answer with an inv of our whole pool (BIP35). Bounded to one message.
         uint8_t (*ids)[32] = malloc(sizeof *ids * 1000);
         if (!ids) return;
-        size_t n = mempool_txids(ids, 1000);
+        size_t n0 = mempool_txids(ids, 1000), n = 0;
+        for (size_t i = 0; i < n0; i++)                      // BIP133: skip txs below its filter
+            if (feefilter_allows(c->feefilter, mempool_feerate(ids[i]))) memmove(ids[n++], ids[i], 32);
         if (n) {
             uint8_t *inv = malloc(3 + n * 36);
             if (inv) { int io = 0; put_varint(inv, &io, (uint64_t)n);
@@ -2073,7 +2098,7 @@ static int conn_host_live(SConn *conns, const SConn *except, const char *host) {
 // dial loop resolves it per attempt.
 static void seat_point(SConn *c, const char *host, uint16_t rp) {
     snprintf(c->host, sizeof c->host, "%s", host);
-    c->rport = rp; c->redial_at = 0; c->hip[0] = 0;
+    c->rport = rp; c->redial_at = 0; c->hip[0] = 0; c->redial_fails = 0;
     unsigned char a4[4]; struct in6_addr a6;
     if (inet_pton(AF_INET, host, a4) == 1 || inet_pton(AF_INET6, host, &a6) == 1)
         snprintf(c->hip, sizeof c->hip, "%s", host);
@@ -2407,9 +2432,10 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                         c->outbound = 0; c->mesh_seat = 0; c->chain_seat = 0; c->host[0] = 0; c->hip[0] = 0;
                         continue;
                     }
-                    c->redial_at = now + 15; continue;   // configured peer: keep trying
+                    c->redial_fails = redial_next_fails(c->redial_fails, -1);   // configured peer: keep trying, backed off
+                    c->redial_at = now + (time_t)redial_delay(c->redial_fails, redial_rnd()); continue;
                 }
-                c->fd = fd; c->up = 1; c->sent_ver = 1; c->magic = coin->magic;
+                c->fd = fd; c->up = 1; c->up_at = now; c->sent_ver = 1; c->magic = coin->magic;
                 c->last_rx = now; c->last_ping = 0; c->peer_h = ph;
                 // record the CONNECTED remote addr — the addr book stays numeric,
                 // and the seat identity snaps to where the socket actually landed
