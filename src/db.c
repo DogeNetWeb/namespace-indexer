@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>         // INT64_MIN
 #include <arpa/inet.h>      // inet_pton — idx_db_peers_scrub's numeric test
 
 static const char *SCHEMA =
@@ -583,6 +584,7 @@ int idx_db_oracle_warm(sqlite3 *db, void *oracle) {
 // idx_sync_rollback's BEGIN IMMEDIATE it nests, so the reorg's prune + replay +
 // projection commit (or vanish) together.
 static int ckpt_maybe(sqlite3 *db, SmState *s);
+static int retain_step(sqlite3 *db, SmState *s);
 int idx_db_project(sqlite3 *db, SmState *s) {
     if (sqlite3_exec(db, "SAVEPOINT idx_project", NULL, NULL, NULL) != SQLITE_OK) return 0;
     int ok = sqlite3_exec(db, "DELETE FROM names; DELETE FROM commits; DELETE FROM muts;", NULL, NULL, NULL) == SQLITE_OK;
@@ -619,6 +621,7 @@ int idx_db_project(sqlite3 *db, SmState *s) {
     // Sentinel: the height this projection reflects, written INSIDE the same
     // transaction so it commits atomically with the rebuilt tables (or not at all).
     if (ok) { char hb[32]; snprintf(hb, sizeof hb, "%lld", (long long)s->cur_height); ok = meta_set(db, "proj_height", hb); }
+    if (ok) ok = retain_step(db, s);   // raw-block retention (before the keep-N prune: it protects the floor)
     if (ok) ok = ckpt_maybe(db, s);
     if (ok && sqlite3_exec(db, "RELEASE idx_project", NULL, NULL, NULL) == SQLITE_OK) return 1;
     sqlite3_exec(db, "ROLLBACK TO idx_project", NULL, NULL, NULL);   // leave the prior projection + proj_height intact
@@ -737,6 +740,10 @@ int idx_db_ckpt_save(sqlite3 *db, SmState *s) {
             else if (rc != SQLITE_DONE) ok = 0;
             sqlite3_finalize(q);
         }
+        // never below the raw-block retention floor: the checkpoint AT raw_floor is the
+        // only replay base left once the raw blocks under it are pruned
+        int64_t rf = idx_db_raw_floor(db);
+        if (rf >= 0 && floor_h > rf) floor_h = rf;
         if (ok && floor_h >= 0) ok = ck_exec(db, "DELETE FROM rb_ckpt WHERE height<?1", floor_h);
     }
     return ok;
@@ -753,11 +760,19 @@ static int ckpt_maybe(sqlite3 *db, SmState *s) {
     if (last < 0 && s->cur_height < (int64_t)s->activation_height + every) return 1;
     return idx_db_ckpt_save(db, s);
 }
+static int64_t ckpt_load_between(sqlite3 *db, int64_t min_height, int64_t max_height, SmState *s);
+// Never below raw_floor: under it the raw blocks are gone, so an older row could
+// not be replayed forward (and is deleted by the retention step anyway).
 int64_t idx_db_ckpt_load(sqlite3 *db, int64_t max_height, SmState *s) {
+    int64_t rf = idx_db_raw_floor(db);
+    return ckpt_load_between(db, rf >= 0 ? rf : INT64_MIN, max_height, s);
+}
+static int64_t ckpt_load_between(sqlite3 *db, int64_t min_height, int64_t max_height, SmState *s) {
     sqlite3_stmt *st;
-    if (sqlite3_prepare_v2(db, "SELECT height,digest,state FROM rb_ckpt WHERE height<=?1 AND activation=?2"
+    if (sqlite3_prepare_v2(db, "SELECT height,digest,state FROM rb_ckpt WHERE height<=?1 AND height>=?3 AND activation=?2"
                                " ORDER BY height DESC", -1, &st, NULL) != SQLITE_OK) return -1;
     sqlite3_bind_int64(st, 1, max_height); sqlite3_bind_int64(st, 2, (int64_t)s->activation_height);
+    sqlite3_bind_int64(st, 3, min_height);
     int64_t got = -1;
     while (got < 0 && sqlite3_step(st) == SQLITE_ROW) {
         int64_t h = sqlite3_column_int64(st, 0);
@@ -831,6 +846,60 @@ int idx_db_ckpt_seed(sqlite3 *db, SmState *s) {
     if (ok && sqlite3_exec(db, "RELEASE ckpt_seed", NULL, NULL, NULL) == SQLITE_OK) return idx_db_ckpt_count(db) > 0;
     sqlite3_exec(db, "ROLLBACK TO ckpt_seed", NULL, NULL, NULL); sqlite3_exec(db, "RELEASE ckpt_seed", NULL, NULL, NULL);
     return -1;
+}
+
+// ── raw-block retention (local-only; never on the wire, never digested) ──────
+// raw_blocks is the reorg-replay substrate. Only the last IDX_RAW_KEEP (288)
+// blocks are kept: raw_floor (meta) is the newest digest-valid rollback
+// checkpoint at or below tip-288, and every raw block at or below it is
+// deleted together with the checkpoints under it. A rollback to T >= raw_floor
+// loads the newest valid checkpoint in [raw_floor, T] and replays (base, T]
+// exactly as before; T < raw_floor is refused (IDX_ROLLBACK_TOO_DEEP) with
+// nothing touched. The blocks summary rows (oracle, MTP, locator) are never
+// pruned. No checkpoint <= tip-288 (checkpoints off, or none yet) = nothing
+// is pruned. The floor only moves up.
+// The floor needs a checkpoint <= tip-288 to still exist: the keep-4 rotation
+// spans 3*rb_ckpt_every heights, so retention is active when 3*every >= 288
+// (default every = 1000); with a smaller interval it simply never prunes.
+int64_t idx_raw_keep = IDX_RAW_KEEP;   // test override (<= 0: retention off)
+int64_t idx_db_raw_floor(sqlite3 *db) {
+    char b[32]; return meta_get(db, "raw_floor", b, sizeof b) ? strtoll(b, NULL, 10) : -1;
+}
+// Runs inside idx_db_project's savepoint (atomic with the projection).
+static int retain_step(sqlite3 *db, SmState *s) {
+    if (idx_raw_keep <= 0 || s->cur_height < (int64_t)s->activation_height) return 1;
+    int64_t limit = s->cur_height - idx_raw_keep, floor = idx_db_raw_floor(db);
+    if (limit < 0 || limit <= floor) return 1;
+    {   // cheap probe first: any checkpoint row in (floor, limit] at all?
+        sqlite3_stmt *st; int any = 0;
+        if (sqlite3_prepare_v2(db, "SELECT 1 FROM rb_ckpt WHERE height>?1 AND height<=?2 LIMIT 1", -1, &st, NULL) != SQLITE_OK) return 0;
+        sqlite3_bind_int64(st, 1, floor); sqlite3_bind_int64(st, 2, limit);
+        any = sqlite3_step(st) == SQLITE_ROW; sqlite3_finalize(st);
+        if (!any) return 1;
+    }
+    // the new floor must be a checkpoint that actually LOADS (digest-verified):
+    // it becomes the only replay base for everything under it
+    SmState *t = sm_new(s->activation_height); if (!t) return 0;
+    int64_t got = ckpt_load_between(db, floor + 1, limit, t);
+    sm_free(t);
+    if (got < 0) return 1;                   // no valid candidate: keep everything
+    sqlite3_stmt *st; int ok = 0, pruned = 0;
+    if (sqlite3_prepare_v2(db, "DELETE FROM raw_blocks WHERE height<=?1", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, got); ok = sqlite3_step(st) == SQLITE_DONE;
+        pruned = sqlite3_changes(db); sqlite3_finalize(st);
+    }
+    if (ok) ok = ck_exec(db, "DELETE FROM rb_ckpt WHERE height<?1", got);
+    if (ok) { char b[32]; snprintf(b, sizeof b, "%lld", (long long)got); ok = meta_set(db, "raw_floor", b); }
+    if (ok) fprintf(stderr, "raw retention: floor %lld -> %lld (tip %lld, keep %lld), pruned %d raw block(s)\n",
+                    (long long)floor, (long long)got, (long long)s->cur_height, (long long)idx_raw_keep, pruned);
+    return ok;
+}
+int idx_db_retain(sqlite3 *db, SmState *s) {
+    if (sqlite3_exec(db, "SAVEPOINT idx_retain", NULL, NULL, NULL) != SQLITE_OK) return 0;
+    int ok = retain_step(db, s);
+    if (ok && sqlite3_exec(db, "RELEASE idx_retain", NULL, NULL, NULL) == SQLITE_OK) return 1;
+    sqlite3_exec(db, "ROLLBACK TO idx_retain", NULL, NULL, NULL); sqlite3_exec(db, "RELEASE idx_retain", NULL, NULL, NULL);
+    return 0;
 }
 
 int idx_db_load_state(sqlite3 *db, SmState *s) {

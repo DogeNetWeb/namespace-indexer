@@ -86,7 +86,7 @@ static void fold_close(Fold *f) { oracle_free(f->o); sm_free(f->s); idx_db_close
 // what the sync loop does on a reorg: rollback, then stamp the cursor
 static int reorg_to(const char *dbpath, int64_t fork) {
     Fold f; if (!fold_open(&f, dbpath)) return 0;
-    int ok = idx_sync_rollback(&f.s, f.db, f.o, (int64_t)f.s->activation_height, fork);
+    int ok = idx_sync_rollback(&f.s, f.db, f.o, (int64_t)f.s->activation_height, fork) == 1;
     if (ok) { uint8_t tip[32]; memset(tip, 0, 32); idx_db_block_get(f.db, fork, tip); idx_db_save_sync(f.db, fork, tip); }
     fold_close(&f); return ok;
 }

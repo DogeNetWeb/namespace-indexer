@@ -1391,6 +1391,8 @@ indexer acts on a boundary only once it is `REORG_BUFFER`-deep.
 disconnected blocks and **replay** from the fork point (exact). Never treat reorg-able state as
 final.
 
+*(Non-normative: the reference indexer keeps only the last 288 raw blocks; reorgs deeper than 288 blocks are refused safely and require a resync from the checkpoint.)*
+
 **Conformance is defined by the shipped fold-vector set** (`(prior state + block/range) →
 resulting state or drop`). It pins, at minimum: the commit→claim
 committer-binding + commitment-copy case; a claim with no live ≥1-deep commit dropping (no FCFS

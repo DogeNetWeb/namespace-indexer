@@ -81,6 +81,7 @@ static int usage(const char *p) {
       "  owned  <db> <hash160hex> list names owned by an address\n"
       "  digest <db>              print height, live §3.4 rate, and the state digest\n"
       "  refold <db>              rebuild the fold from local blocks under current rules\n"
+      "  retain <db>              prune raw blocks to the last 288 (+ one-time VACUUM migration)\n"
       "  watch  <db> <addr|h160>  register a wallet address for UTXO tracking (before funding!)\n"
       "  index  <blockfile>       fold a raw block file (hex or binary) — offline\n",
       p);
@@ -95,7 +96,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "mkblocks")) return argc > 2 ? chain_mkblocks(argv[2]) : usage(argv[0]);
     if (!strcmp(cmd, "sync") || !strcmp(cmd, "resolve") || !strcmp(cmd, "owned") ||
         !strcmp(cmd, "digest") || !strcmp(cmd, "index") ||
-        !strcmp(cmd, "watch") || !strcmp(cmd, "refold") || !strcmp(cmd, "crawl") ||
+        !strcmp(cmd, "watch") || !strcmp(cmd, "refold") || !strcmp(cmd, "retain") || !strcmp(cmd, "crawl") ||
         !strcmp(cmd, "serve") || !strcmp(cmd, "weigh"))
         return indexer_main(argc, argv);
     return usage(argv[0]);

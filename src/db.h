@@ -121,6 +121,18 @@ int     idx_db_ckpt_count(sqlite3 *db);
 // Empty table + loaded projection >= activation+every: take one now (1), else 0; -1 error.
 int     idx_db_ckpt_seed(sqlite3 *db, SmState *s);
 extern size_t idx_ckpt_max_bytes;   // state blob cap (tests may lower it)
+// ckpt_load never returns a row below raw_floor (see retention below).
+
+// Raw-block retention: raw_blocks keeps only the last IDX_RAW_KEEP blocks.
+// raw_floor (meta, -1 = never pruned) is the newest digest-valid checkpoint
+// <= tip-IDX_RAW_KEEP; raw blocks and checkpoints below it are deleted (raw at
+// it too). idx_db_project runs the step atomically with each projection;
+// idx_db_retain runs it standalone (own savepoint) — 1 ok, 0 error. A rollback
+// below raw_floor is refused (IDX_ROLLBACK_TOO_DEEP, indexer.h).
+#define IDX_RAW_KEEP 288
+extern int64_t idx_raw_keep;        // window (tests may lower it; <= 0 = off)
+int64_t idx_db_raw_floor(sqlite3 *db);
+int     idx_db_retain(sqlite3 *db, SmState *s);
 
 // ── epochs projection (ownership history — substrate for overlay layers) ─
 // An append-only per-block record of every ownership CHANGE: (name, start_height,

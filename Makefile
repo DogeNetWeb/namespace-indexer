@@ -99,6 +99,12 @@ test_reorg: $(TEST_SRCS) src/test_reorg.c $(SECPLIB)
 test_rollback: $(TEST_SRCS) src/test_rollback.c $(SECPLIB)
 	$(CC) $(CFLAGS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ $(TEST_SRCS) src/test_rollback.c $(LIBS)
 
+# test_retain: raw-block retention (last 288) — prune-then-rollback == fresh
+# sync across expiry/lapse, below-floor refusal, migration. RETAIN_LIVE_DB=<copy>
+# adds the live-db section.
+test_retain: $(TEST_SRCS) src/test_retain.c $(SECPLIB)
+	$(CC) $(CFLAGS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ $(TEST_SRCS) src/test_retain.c $(LIBS)
+
 # test_serve covers src/serve_store.c — the peer-facing getheaders/getblocks/
 # getdata cache + the blockstage mailbox — which no other suite touches. It
 # needs only serve_store.c and sqlite, so it links its own tiny composition
@@ -114,8 +120,8 @@ test_relay: $(TEST_SRCS) src/test_relay.c src/relay_policy.h $(SECPLIB)
 # for the shipped selftest. The python tests open loopback sockets; run under
 # `unshare -rn` (they bring `lo` up themselves when they can).
 # Every suite runs even if an earlier one fails; the target fails if any did.
-check: test_db test_sync test_codec test_serve test_reorg test_rollback test_relay indexerd
-	@rc=0; for t in ./test_db ./test_sync ./test_codec ./test_serve ./test_reorg ./test_rollback ./test_relay; do \
+check: test_db test_sync test_codec test_serve test_reorg test_rollback test_retain test_relay indexerd
+	@rc=0; for t in ./test_db ./test_sync ./test_codec ./test_serve ./test_reorg ./test_rollback ./test_retain ./test_relay; do \
 	  echo "=== $$t ==="; $$t || rc=1; done; \
 	echo "=== scripts/test_peer_height.py ==="; python3 scripts/test_peer_height.py ./indexerd || rc=1; \
 	echo "=== scripts/test_feefilter.py ==="; python3 scripts/test_feefilter.py ./indexerd || rc=1; \

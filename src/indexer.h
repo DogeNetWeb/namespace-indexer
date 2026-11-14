@@ -182,7 +182,10 @@ uint16_t idx_coin_port(const char *coin);
 
 // Reorg rollback to `to_height` (kept): prune the height-keyed projections above
 // it, drop its oracle rows, rebuild the fold state by replaying the stored raw
-// carrier blocks. Replaces *s. Returns 1, 0 on a replay failure.
+// carrier blocks. Replaces *s. Returns 1, 0 on a replay failure, or
+// IDX_ROLLBACK_TOO_DEEP when to_height is below the raw-block retention floor
+// (only the last 288 raw blocks are kept) — then NOTHING was changed.
+#define IDX_ROLLBACK_TOO_DEEP (-1)
 int idx_sync_rollback(SmState **s, sqlite3 *db, OracleFeed *oracle,
                       int64_t activation, int64_t to_height);
 

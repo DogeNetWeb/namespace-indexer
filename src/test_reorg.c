@@ -44,7 +44,7 @@ static int r_rollback(const char *dbp, int64_t fork_h) {
     idx_db_load_state(db, s);
     OracleFeed *o = oracle_new(); idx_db_oracle_warm(db, o);
     oracle_set_subsidy(o, idx_db_get_subsidy(db, 10000LL * SM_KOINU_PER_DOGE));
-    int ok = idx_sync_rollback(&s, db, o, (int64_t)s->activation_height, fork_h) != 0;
+    int ok = idx_sync_rollback(&s, db, o, (int64_t)s->activation_height, fork_h) == 1;
     uint8_t h[32] = {0}; ok = ok && idx_db_block_get(db, fork_h, h);
     if (ok) idx_db_save_sync(db, fork_h, h);
     oracle_free(o); sm_free(s); idx_db_close(db); return ok;

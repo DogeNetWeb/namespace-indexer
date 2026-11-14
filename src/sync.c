@@ -218,6 +218,13 @@ static int rollback_replay_exact(SmState **s, sqlite3 *db, OracleFeed *oracle,
     sm_free(*s);
     *s = sm_new((uint64_t)activation);
     int64_t base = use_ckpt ? idx_db_ckpt_load(db, to_height, *s) : -1;
+    if (base < 0 && idx_db_raw_floor(db) >= 0) {
+        // raw blocks under raw_floor are pruned: a replay from activation would
+        // silently drop their actions. No valid checkpoint in [floor, to] = fail.
+        fprintf(stderr, "rollback to %lld: no valid checkpoint at/above the raw floor %lld — cannot replay\n",
+                (long long)to_height, (long long)idx_db_raw_floor(db));
+        return 0;
+    }
     if (base < 0) base = INT64_MIN;
     FoldCtx fc = { .s = *s, .db = db, .oracle = oracle };
     fold_load_watch(&fc);
@@ -272,8 +279,19 @@ void (*idx_sync_rollback_test_hook)(sqlite3 *db, int64_t to_height) = NULL;
 // pre-reorg db exactly as it was. oracle_rollback is in-RAM only; on failure
 // the oracle and *s are reloaded from the untouched db, so the caller sees the
 // committed pre-rollback state. Nested in an open transaction it uses a SAVEPOINT.
+//
+// Raw-block retention: below raw_floor the raw blocks are gone, so a rollback
+// to to_height < raw_floor is refused up front — IDX_ROLLBACK_TOO_DEEP, with
+// the db, *s and the oracle untouched.
 int idx_sync_rollback(SmState **s, sqlite3 *db, OracleFeed *oracle,
                       int64_t activation, int64_t to_height) {
+    int64_t rfloor = idx_db_raw_floor(db);
+    if (rfloor >= 0 && to_height < rfloor) {
+        fprintf(stderr, "rollback to %lld REFUSED: below the raw-block floor %lld (only the last %lld raw blocks are kept)"
+                        " — a reorg this deep needs a resync from the checkpoint\n",
+                (long long)to_height, (long long)rfloor, (long long)IDX_RAW_KEEP);
+        return IDX_ROLLBACK_TOO_DEEP;
+    }
     int outer = sqlite3_get_autocommit(db) != 0;
     if (sqlite3_exec(db, outer ? "BEGIN IMMEDIATE" : "SAVEPOINT idx_rollback", NULL, NULL, NULL) != SQLITE_OK)
         return 0;
@@ -446,6 +464,14 @@ static int cmd_refold(int argc, char **argv) {
     sqlite3 *db = idx_db_open(argv[2]); if (!db) { fprintf(stderr, "cannot open db\n"); return 1; }
     int64_t height = 0; uint8_t tip[32];
     if (!idx_db_load_sync(db, &height, tip)) { fprintf(stderr, "db has no sync state\n"); idx_db_close(db); return 1; }
+    if (idx_db_raw_floor(db) >= 0) {
+        // retention pruned the raw blocks under raw_floor: a full refold has no
+        // substrate. Refuse BEFORE wiping epochs/checkpoints.
+        fprintf(stderr, "refold refused: this db keeps only the last %lld raw blocks (raw_floor %lld);"
+                        " a refold needs full history — resync from the checkpoint instead\n",
+                (long long)IDX_RAW_KEEP, (long long)idx_db_raw_floor(db));
+        idx_db_close(db); return 1;
+    }
     int64_t activation = idx_db_get_activation(db, 0);
     SmState *s = sm_new((uint64_t)activation);
     OracleFeed *oracle = oracle_new();
@@ -457,7 +483,7 @@ static int cmd_refold(int argc, char **argv) {
     idx_db_epochs_wipe(db);
     idx_db_epochs_mark(db, 0);
     idx_db_ckpt_wipe(db);                    // rules may have changed: old states are void
-    if (!idx_sync_rollback(&s, db, oracle, activation, height)) {
+    if (idx_sync_rollback(&s, db, oracle, activation, height) != 1) {
         fprintf(stderr, "refold failed\n");
         oracle_free(oracle); sm_free(s); idx_db_close(db); return 1;
     }
@@ -1026,6 +1052,36 @@ static int cmd_weigh(int argc, char **argv) {
 #define SYNC_PARITY_GRACE_S 900
 static time_t s_parity;
 
+// Raw-block retention (keep the last IDX_RAW_KEEP): catch up the floor now
+// (an upgraded db prunes its old raw blocks here), then VACUUM once
+// ("raw_retention_v1") to hand the freed pages back. Run at every sync pass
+// start (a no-op once the floor is current) and by `retain <db>`.
+// s must be the loaded projection with cur_height = proj_height.
+static int retain_migrate(sqlite3 *db, SmState *s) {
+    int ok = 1;
+    if (!idx_db_retain(db, s)) { fprintf(stderr, "raw retention: prune failed (retried next pass)\n"); ok = 0; }
+    if (!idx_db_flag_get(db, "raw_retention_v1")) {
+        if (sqlite3_exec(db, "VACUUM", NULL, NULL, NULL) == SQLITE_OK) {
+            idx_db_flag_set(db, "raw_retention_v1");
+            fprintf(stderr, "raw retention: migrated (raw_floor %lld, keep %lld), VACUUM done\n",
+                    (long long)idx_db_raw_floor(db), (long long)IDX_RAW_KEEP);
+        } else { fprintf(stderr, "raw retention: VACUUM failed (%s) — retried next pass\n", sqlite3_errmsg(db)); ok = 0; }
+    }
+    return ok;
+}
+// retain <db> — run the retention step + one-time migration on a db (offline).
+static int cmd_retain(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: retain <db>\n"); return 2; }
+    sqlite3 *db = idx_db_open(argv[2]); if (!db) { fprintf(stderr, "cannot open db\n"); return 1; }
+    int64_t ph = idx_db_projected_height(db);
+    if (ph < 0) { fprintf(stderr, "db has no projection\n"); idx_db_close(db); return 1; }
+    SmState *s = sm_new((uint64_t)idx_db_get_activation(db, 0));
+    idx_db_load_state(db, s); s->cur_height = ph;
+    int ok = retain_migrate(db, s);
+    printf("raw_floor %lld\n", (long long)idx_db_raw_floor(db));
+    sm_free(s); idx_db_close(db); return ok ? 0 : 1;
+}
+
 static int cmd_sync(int argc, char **argv) {
     // sync <coin> <db> [peers] [activation] — peers: comma-separated host[:port]
     // list tried first (hostnames ok), or "auto" for cache+seeds only.
@@ -1080,7 +1136,15 @@ static int cmd_sync(int argc, char **argv) {
         if (to >= 0 && to < height) {
             fprintf(stderr, "wallet re-walk: re-verifying spends over blocks %lld..%lld\n",
                     (long long)(to + 1), (long long)height);
-            if (idx_sync_rollback(&s, db, oracle, activation, to)) {
+            int rrc = idx_sync_rollback(&s, db, oracle, activation, to);
+            if (rrc == IDX_ROLLBACK_TOO_DEEP) {
+                // the walk would start under the raw floor: nothing local to
+                // replay from. Retention only ever runs on a db this build owns,
+                // whose rollback replay already preserves standing spends.
+                fprintf(stderr, "wallet re-walk: start %lld is below the raw floor — skipped (resync from the checkpoint to re-walk)\n",
+                        (long long)(to + 1));
+                idx_db_flag_set(db, "wallet_rewalk_v1");
+            } else if (rrc == 1) {
                 height = to;
                 if (height <= coin->start) { height = coin->start; memcpy(tip, coin->start_hash, 32); }
                 else if (!idx_db_block_get(db, height, tip)) memcpy(tip, coin->start_hash, 32);
@@ -1098,6 +1162,7 @@ static int cmd_sync(int argc, char **argv) {
     s->cur_height = height;
     if (idx_db_ckpt_seed(db, s) == 1)
         fprintf(stderr, "rb_ckpt: first checkpoint taken on open at height %lld\n", (long long)height);
+    retain_migrate(db, s);
     FoldCtx fc = { .s = s, .db = db, .oracle = oracle };
     fold_load_watch(&fc);
     // serve cache: the header chain + rolling block window, a separate aux db
@@ -1189,10 +1254,17 @@ static int cmd_sync(int argc, char **argv) {
                     if (ok && idx_pow_work_cmp(bc.work, ours) > 0) verdict = 1;
                     else verdict = -1;                  // lighter, invalid, or unweighable
                 }
+                if (verdict == 1 && idx_db_raw_floor(db) >= 0 && fork_h < idx_db_raw_floor(db)) {
+                    // (unreachable with a 32-deep stage walk and a 288 window; kept for safety)
+                    fprintf(stderr, "REORG REFUSED (mesh stage): fork %lld is below the raw-block floor %lld"
+                                    " — keeping our tip %lld; resync from the checkpoint if this branch is real\n",
+                            (long long)fork_h, (long long)idx_db_raw_floor(db), (long long)height);
+                    verdict = -1;
+                }
                 if (verdict == 1) {
                     fprintf(stderr, "reorg (mesh stage): branch at height %lld outweighs our tip %lld — rolling back\n",
                             (long long)fork_h, (long long)height);
-                    if (!idx_sync_rollback(&s, db, oracle, activation, fork_h)) {
+                    if (idx_sync_rollback(&s, db, oracle, activation, fork_h) != 1) {
                         // state is not trustworthy past a failed replay — bail hard
                         fprintf(stderr, "rollback replay failed — aborting sync\n");
                         for (int i = 0; i < bn; i++) free(raws[i]);
@@ -1451,7 +1523,15 @@ static int cmd_sync(int argc, char **argv) {
                   } }
                 fprintf(stderr, "reorg: peer branch at height %lld outweighs our tip %lld — rolling back\n",
                         (long long)fork_h, (long long)height);
-                if (!idx_sync_rollback(&s, db, oracle, activation, fork_h)) {
+                int rrc = idx_sync_rollback(&s, db, oracle, activation, fork_h);
+                if (rrc == IDX_ROLLBACK_TOO_DEEP) {
+                    // nothing was touched: keep our chain (stall on this branch, loudly)
+                    fprintf(stderr, "REORG REFUSED: peer branch at %lld is below the raw-block floor %lld"
+                                    " — keeping our tip %lld; resync from the checkpoint if this branch is real\n",
+                            (long long)fork_h, (long long)idx_db_raw_floor(db), (long long)height);
+                    free(pl); recvd++; continue;
+                }
+                if (rrc != 1) {
                     // state is not trustworthy past a failed replay — bail hard
                     fprintf(stderr, "rollback replay failed — aborting sync\n");
                     free(pl); close(fd); serve_store_close(fc.serve); oracle_free(oracle); sm_free(s); idx_db_close(db); return 1;
@@ -2856,6 +2936,7 @@ int indexer_main(int argc, char **argv) {
     if (!strcmp(cmd, "owned"))   return cmd_owned(argc, argv);
     if (!strcmp(cmd, "digest"))  return cmd_digest(argc, argv);
     if (!strcmp(cmd, "refold"))  return cmd_refold(argc, argv);
+    if (!strcmp(cmd, "retain"))  return cmd_retain(argc, argv);
     if (!strcmp(cmd, "watch"))   return cmd_watch(argc, argv);
     if (!strcmp(cmd, "sync"))    return cmd_sync(argc, argv);
     if (!strcmp(cmd, "crawl"))   return cmd_crawl(argc, argv);
