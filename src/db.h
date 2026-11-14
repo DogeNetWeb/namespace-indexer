@@ -23,7 +23,8 @@ void idx_db_save_sync(sqlite3 *db, int64_t height, const uint8_t tip_hash[32]);
 int  idx_db_load_sync(sqlite3 *db, int64_t *height, uint8_t tip_hash[32]);   // 1 if present
 // last observed peer start_height from a version handshake — the fail-closed
 // error page (and anything else in another process) reads this; 0 if never seen
-void    idx_db_set_peer_height(sqlite3 *db, int64_t h);
+void    idx_db_set_peer_height(sqlite3 *db, int64_t h);   // monotonic max (same as raise)
+void    idx_db_raise_peer_height(sqlite3 *db, int64_t h);   // monotonic max
 int64_t idx_db_get_peer_height(sqlite3 *db);
 void idx_db_set_activation(sqlite3 *db, int64_t activation);
 int64_t idx_db_get_activation(sqlite3 *db, int64_t dflt);
@@ -104,6 +105,22 @@ int64_t idx_db_projected_height(sqlite3 *db);   // height the last projection re
 // Restore a fold state from the projection (inverse of project). Caller passes a
 // fresh sm_new(activation); fields are loaded verbatim. Returns rows loaded.
 int  idx_db_load_state(sqlite3 *db, SmState *s);
+
+// Rollback checkpoints — local replay shortcut, never digested or sent. A row is
+// the projected fold state at a height; idx_db_project takes one every
+// idx_db_ckpt_every() heights (meta rb_ckpt_every; 0 = off) and keeps the last 4.
+// ckpt_load restores the newest valid row <= max_height whose activation matches
+// s->activation_height into *s (a fresh sm_new); it returns that height, or -1.
+int64_t idx_db_ckpt_every(sqlite3 *db);
+void    idx_db_ckpt_set_every(sqlite3 *db, int64_t every);
+int     idx_db_ckpt_save(sqlite3 *db, SmState *s);
+int64_t idx_db_ckpt_load(sqlite3 *db, int64_t max_height, SmState *s);
+int     idx_db_ckpt_prune_above(sqlite3 *db, int64_t height);
+int     idx_db_ckpt_wipe(sqlite3 *db);
+int     idx_db_ckpt_count(sqlite3 *db);
+// Empty table + loaded projection >= activation+every: take one now (1), else 0; -1 error.
+int     idx_db_ckpt_seed(sqlite3 *db, SmState *s);
+extern size_t idx_ckpt_max_bytes;   // state blob cap (tests may lower it)
 
 // ── epochs projection (ownership history — substrate for overlay layers) ─
 // An append-only per-block record of every ownership CHANGE: (name, start_height,

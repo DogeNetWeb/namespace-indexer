@@ -47,6 +47,16 @@ extern volatile int idx_sync_stop;
 // signal — a caught-up getblocks is answered with silence — so embedding
 // hosts use it to render truthful sync state. The headless CLI just logs it.
 extern volatile int64_t idx_sync_peer_height;
+// peer_height follows block announcements (inv / headers / pushed blocks we
+// can place on our chain, and blocks folded from the sync peer), not only the
+// handshake's start_height. Monotonic; the meta write is rate-limited to one
+// per IDX_PH_WRITE_MIN_S (force = flush now, e.g. at pass end). Returns the
+// best height noted so far. db may be NULL (memory only).
+#define IDX_PH_WRITE_MIN_S 60
+struct sqlite3;
+void    idx_peer_height_load(struct sqlite3 *db);   /* seed g_ph_* from meta on db open */
+int64_t idx_peer_height_note(struct sqlite3 *db, int64_t h, int64_t now, int force);
+void    idx_peer_height_reset(void);   /* tests */
 
 // The user-agent (subver) sent in our version message. A "/dogenet-…/" prefix
 // is the mesh's discovery mark (peer-discovery design): crawlers classify a

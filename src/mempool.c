@@ -1,6 +1,7 @@
 // mempool.c — see mempool.h. Two chained hash tables (by txid, by prevout) over
 // a shared set of entries, one mutex, static zero-initialized state.
 #include "mempool.h"
+#include "relay_policy.h"
 #include "txcheck.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,9 @@ typedef struct MpEntry {
     uint8_t  txid[32];
     uint8_t *raw; size_t len;
     int64_t  added;
+    int64_t  feerate;                 // koinu/kB; -1 unknown (a parent not pooled)
+    int64_t  outsum;                  // sum of output values
+    int64_t *outv; int nout;          // output values, kept so children never re-parse us
     uint8_t (*prev)[36]; int nprev;
     struct MpEntry *hnext;            // txid bucket chain
 } MpEntry;
@@ -54,6 +58,36 @@ static MpEntry *prevout_owner(const uint8_t prevout[36]) {
     return NULL;
 }
 
+// bytes an entry counts against MEMPOOL_MAX_BYTES: raw tx + its stored output values
+static size_t entry_cost(size_t len, int nout) { return len + (size_t)nout * sizeof(int64_t); }
+
+// caller holds g_mu. Fee rate from pooled parents' stored output values (no
+// UTXO set, no re-parse): O(n_in) hash lookups. Any input whose parent is not
+// pooled makes the rate unknown (-1) — unknown is relayed, see relay_policy.h.
+static int64_t entry_feerate_locked(const MpEntry *e) {
+    int64_t in = 0;
+    for (int i = 0; i < e->nprev; i++) {
+        const uint8_t *po = e->prev[i];
+        uint32_t vout = po[32] | (po[33] << 8) | (po[34] << 16) | ((uint32_t)po[35] << 24);
+        MpEntry *pe = find_entry(po);
+        if (!pe || vout >= (uint32_t)pe->nout) return -1;
+        in += pe->outv[vout];            // each outv <= TX_MAX_MONEY: no overflow before the check
+        if (in > TX_MAX_MONEY) return -1;   // impossible on-chain; never wrap int64
+    }
+    if (in < e->outsum) return -1;
+    return feerate_per_kb(in - e->outsum, e->len);
+}
+// caller holds g_mu. `e` just joined: any pooled child spending its outputs
+// (an orphan that arrived first) can now have its rate computed.
+static void refresh_children_locked(const MpEntry *e) {
+    uint8_t po[36]; memcpy(po, e->txid, 32);
+    for (int v = 0; v < e->nout; v++) {
+        po[32] = (uint8_t)v; po[33] = (uint8_t)(v >> 8); po[34] = (uint8_t)(v >> 16); po[35] = (uint8_t)(v >> 24);
+        MpEntry *ch = prevout_owner(po);
+        if (ch && ch != e) ch->feerate = entry_feerate_locked(ch);
+    }
+}
+
 // caller holds g_mu. Unlink from both tables, free.
 static void remove_entry(MpEntry *e) {
     unsigned b = tx_h(e->txid);
@@ -66,8 +100,8 @@ static void remove_entry(MpEntry *e) {
                 MpPrev *dead = *pp; *pp = dead->hnext; free(dead); break;
             }
     }
-    g_count--; g_bytes -= e->len;
-    free(e->prev); free(e->raw); free(e);
+    g_count--; g_bytes -= entry_cost(e->len, e->nout);
+    free(e->outv); free(e->prev); free(e->raw); free(e);
 }
 
 // caller holds g_mu, and the pool is non-empty. Evict the oldest entry.
@@ -128,7 +162,7 @@ int mempool_accept(const uint8_t *raw, size_t len, uint8_t txid_out[32],
         if (prevout_owner(tx.ins[i].prevout)) { pthread_mutex_unlock(&g_mu); idx_tx_free(&tx);
             if (reason && rc) snprintf(reason, rc, "conflicting input (double-spend)"); return 0; }
 
-    while (g_count >= MEMPOOL_MAX_TXS || g_bytes + len > MEMPOOL_MAX_BYTES) {
+    while (g_count >= MEMPOOL_MAX_TXS || g_bytes + entry_cost(len, tx.n_out) > MEMPOOL_MAX_BYTES) {
         if (!g_count) break;                    // len alone exceeds the byte cap — shouldn't happen (≤100KB)
         evict_oldest();
     }
@@ -136,8 +170,9 @@ int mempool_accept(const uint8_t *raw, size_t len, uint8_t txid_out[32],
     MpEntry *e = calloc(1, sizeof *e);
     uint8_t *rawcopy = malloc(len);
     uint8_t (*prev)[36] = tx.n_in ? malloc((size_t)tx.n_in * 36) : NULL;
-    if (!e || !rawcopy || (tx.n_in && !prev)) {
-        pthread_mutex_unlock(&g_mu); free(e); free(rawcopy); free(prev); idx_tx_free(&tx);
+    int64_t *outv = malloc((size_t)tx.n_out * sizeof *outv);
+    if (!e || !rawcopy || (tx.n_in && !prev) || !outv) {
+        pthread_mutex_unlock(&g_mu); free(e); free(rawcopy); free(prev); free(outv); idx_tx_free(&tx);
         if (reason && rc) snprintf(reason, rc, "out of memory"); return 0;
     }
     memcpy(e->txid, tx.txid, 32);
@@ -145,6 +180,9 @@ int mempool_accept(const uint8_t *raw, size_t len, uint8_t txid_out[32],
     e->added = (int64_t)time(NULL);
     e->nprev = tx.n_in; e->prev = prev;
     for (int i = 0; i < tx.n_in; i++) memcpy(e->prev[i], tx.ins[i].prevout, 36);
+    e->outv = outv; e->nout = tx.n_out; e->outsum = 0;
+    for (int k = 0; k < tx.n_out; k++) { outv[k] = tx.outs[k].value; e->outsum += outv[k]; }   // txcheck bounds the sum
+    e->feerate = entry_feerate_locked(e);
     // link into txid + prevout tables
     unsigned b = tx_h(e->txid); e->hnext = g_tbucket[b]; g_tbucket[b] = e;
     for (int i = 0; i < e->nprev; i++) {
@@ -153,10 +191,18 @@ int mempool_accept(const uint8_t *raw, size_t len, uint8_t txid_out[32],
         memcpy(pn->prevout, e->prev[i], 36); pn->e = e;
         unsigned pb = pv_h(e->prev[i]); pn->hnext = g_pbucket[pb]; g_pbucket[pb] = pn;
     }
-    g_count++; g_bytes += len;
+    g_count++; g_bytes += entry_cost(len, e->nout);
+    refresh_children_locked(e);
     pthread_mutex_unlock(&g_mu);
     idx_tx_free(&tx);
     return 1;
+}
+
+int64_t mempool_feerate(const uint8_t txid[32]) {
+    pthread_mutex_lock(&g_mu);
+    MpEntry *e = find_entry(txid); int64_t r = e ? e->feerate : -1;
+    pthread_mutex_unlock(&g_mu);
+    return r;
 }
 
 int mempool_has(const uint8_t txid[32]) {
@@ -211,6 +257,7 @@ void mempool_sweep(int64_t now) {
 }
 
 int mempool_count(void) { return g_count; }
+size_t mempool_bytes(void) { pthread_mutex_lock(&g_mu); size_t b = g_bytes; pthread_mutex_unlock(&g_mu); return b; }
 
 size_t mempool_txids(uint8_t (*out)[32], size_t max) {
     size_t n = 0;
@@ -234,7 +281,7 @@ void mempool_reset(void) {
     pthread_mutex_lock(&g_mu);
     for (int b = 0; b < MP_BUCKETS; b++) {
         MpEntry *e = g_tbucket[b];
-        while (e) { MpEntry *next = e->hnext; free(e->prev); free(e->raw); free(e); e = next; }
+        while (e) { MpEntry *next = e->hnext; free(e->outv); free(e->prev); free(e->raw); free(e); e = next; }
         g_tbucket[b] = NULL;
         MpPrev *p = g_pbucket[b];
         while (p) { MpPrev *next = p->hnext; free(p); p = next; }

@@ -607,6 +607,60 @@ static void sec_rewalk(const char *dir) {
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
+// peer_height from announcements: monotonic in memory and on disk, the meta
+// write rate-limited to one per IDX_PH_WRITE_MIN_S, force flushes, and a
+// every write (handshake or announcement) is a monotonic max at the db.
+static void sec_peer_height(const char *dir) {
+    printf("\n-- peer_height follows announcements --\n");
+    char p[700]; snprintf(p, sizeof p, "%s/ph.db", dir);
+    sqlite3 *db = idx_db_open(p);
+    if (!db) { CHECK(0, "open ph.db"); return; }
+    idx_peer_height_reset();
+    int64_t t = 1000000;
+    CHECK(idx_peer_height_note(db, 100, t, 0) == 100 && idx_db_get_peer_height(db) == 100, "first announcement written at once");
+    CHECK(idx_peer_height_note(db, 150, t + 1, 0) == 150 && idx_db_get_peer_height(db) == 100, "second within the window: memory only (rate-limited)");
+    CHECK(idx_peer_height_note(db, 120, t + 2, 0) == 150, "a lower announcement never lowers the best");
+    CHECK(idx_peer_height_note(db, 151, t + IDX_PH_WRITE_MIN_S - 1, 0) == 151 && idx_db_get_peer_height(db) == 100, "still inside the window: no write");
+    idx_peer_height_note(db, 0, t + IDX_PH_WRITE_MIN_S, 0);
+    CHECK(idx_db_get_peer_height(db) == 151, "window elapsed: best written");
+    idx_peer_height_note(db, 160, t + IDX_PH_WRITE_MIN_S + 1, 1);
+    CHECK(idx_db_get_peer_height(db) == 160, "force flushes inside the window");
+    int writes = 0; int64_t last = idx_db_get_peer_height(db);
+    for (int i = 0; i < 1000; i++) {           // a block every second for ~16 min
+        idx_peer_height_note(db, 161 + i, t + 200 + i, 0);
+        int64_t now = idx_db_get_peer_height(db); if (now != last) { writes++; last = now; }
+    }
+    CHECK(writes <= 1000 / IDX_PH_WRITE_MIN_S + 1 && writes >= 1000 / IDX_PH_WRITE_MIN_S - 1, "1000 announcements → ~1 write per window");
+    idx_db_set_peer_height(db, 5000);
+    idx_db_raise_peer_height(db, 4000);
+    CHECK(idx_db_get_peer_height(db) == 5000, "raise never lowers the stored value");
+    // restart: in-memory state wiped, then a lower handshake claim — stored stays
+    idx_db_set_peer_height(db, 900);
+    CHECK(idx_db_get_peer_height(db) == 5000, "set itself is monotonic (900 cannot replace 5000)");
+    idx_peer_height_reset();                                 // process restart
+    idx_db_set_peer_height(db, 500);                         // first handshake after restart
+    CHECK(idx_db_get_peer_height(db) == 5000, "restart: handshake 500 cannot lower stored 5000");
+    // exact scenario: preset 900, restart, handshake 500 → stay 900
+    { char q[700]; snprintf(q, sizeof q, "%s/ph2.db", dir);
+      sqlite3 *d2 = idx_db_open(q); idx_db_set_peer_height(d2, 900);
+      CHECK(idx_db_get_peer_height(d2) == 900, "preset 900");
+      idx_peer_height_reset();
+      idx_db_set_peer_height(d2, 500);
+      CHECK(idx_db_get_peer_height(d2) == 900, "restart: preset 900, handshake 500 → stays 900");
+      idx_db_close(d2); unlink(q); }
+    // load seeds g_ph_disk from DB: after reset+load, note(500) must keep memory+DB at 900
+    { char q[256]; snprintf(q, sizeof q, "%s/ph_load.db", dir); unlink(q);
+      sqlite3 *d2 = idx_db_open(q); idx_db_set_peer_height(d2, 900);
+      CHECK(idx_db_get_peer_height(d2) == 900, "load-seed: preset 900");
+      idx_peer_height_reset();
+      idx_peer_height_load(d2);
+      CHECK(idx_peer_height_note(d2, 500, 1000, 1) == 900, "load-seed: note 500 keeps in-memory best at 900");
+      CHECK(idx_db_get_peer_height(d2) == 900, "load-seed: DB stays 900");
+      idx_db_close(d2); unlink(q); }
+    idx_db_close(db); idx_peer_height_reset();
+    unlink(p);
+}
+
 int main(void) {
     char dir[] = "/tmp/idx_test_sync_XXXXXX";
     if (!mkdtemp(dir)) { fprintf(stderr, "mkdtemp failed\n"); return 1; }
@@ -618,6 +672,7 @@ int main(void) {
     sec_seam(dir);
     sec_bounds(dir);
     sec_rewalk(dir);
+    sec_peer_height(dir);
 
     // teardown
     for (int i = 0; i < NBLK; i++) unlink(g_blk[i]);

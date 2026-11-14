@@ -26,6 +26,10 @@ int  mempool_accept(const uint8_t *raw, size_t len, uint8_t txid_out[32],
                     char *reason, size_t reason_cap);
 
 int  mempool_has(const uint8_t txid[32]);
+// Fee rate (koinu per 1000 bytes) of a pooled tx, or -1 if unknown/not pooled.
+// Known once every input spends an output of a tx also in the pool (a child
+// that arrived before its parent is recomputed when the parent is accepted).
+int64_t mempool_feerate(const uint8_t txid[32]);
 // Malloc a copy of the stored tx bytes for `txid` (caller frees), or NULL.
 uint8_t *mempool_get_copy(const uint8_t txid[32], size_t *len_out);
 
@@ -43,6 +47,8 @@ void mempool_on_confirmed_tx(const uint8_t txid[32], const IdxTx *tx);
 void mempool_sweep(int64_t now);
 
 int    mempool_count(void);
+// Bytes counted against MEMPOOL_MAX_BYTES: each entry's raw length + 8 per output.
+size_t mempool_bytes(void);
 // Copy up to `max` txids out (for answering a `mempool` message / tests).
 size_t mempool_txids(uint8_t (*out)[32], size_t max);
 // Iterate every pooled tx under the lock — cb must not call back into mempool.
