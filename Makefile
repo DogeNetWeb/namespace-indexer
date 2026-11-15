@@ -72,7 +72,7 @@ test: indexerd
 	./indexerd selftest
 
 clean:
-	rm -rf indexerd indexerd.san build
+	rm -rf indexerd indexerd.san indexerd-stalltest build
 
 .PHONY: all test clean
 
@@ -116,19 +116,28 @@ test_serve: src/test_serve.c src/serve_store.c src/serve_store.h
 test_relay: $(TEST_SRCS) src/test_relay.c src/relay_policy.h $(SECPLIB)
 	$(CC) $(CFLAGS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ $(TEST_SRCS) src/test_relay.c $(LIBS)
 
+# indexerd-stalltest: indexerd with SHORT receive deadlines (batch 6 s, weigh
+# 4 s, getblocks round 2 s, handshake 3 s) for scripts/test_sync_stall.py — the
+# slow-loris regression. Same sources; only the four #ifndef deadlines differ.
+STALL_DEFS := -DIDX_SYNC_BATCH_DEADLINE_S=6 -DIDX_SYNC_WEIGH_DEADLINE_S=4 \
+              -DIDX_SYNC_ROUND_MS=2000 -DIDX_NET_SHAKE_DEADLINE_MS=3000
+indexerd-stalltest: $(ALL_SRCS) $(wildcard src/*.h) $(wildcard $(SMDIR)/*.h) $(SECPLIB)
+	$(CC) $(CFLAGS) $(STALL_DEFS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ $(ALL_SRCS) $(LIBS)
+
 # `make check` = the seven suites + the wire-level python tests. Run `make test`
 # for the shipped selftest. The python tests open loopback sockets; run under
 # `unshare -rn` (they bring `lo` up themselves when they can).
 # Every suite runs even if an earlier one fails; the target fails if any did.
-check: test_db test_sync test_codec test_serve test_reorg test_rollback test_retain test_relay indexerd
+check: test_db test_sync test_codec test_serve test_reorg test_rollback test_retain test_relay indexerd indexerd-stalltest
 	@rc=0; for t in ./test_db ./test_sync ./test_codec ./test_serve ./test_reorg ./test_rollback ./test_retain ./test_relay; do \
 	  echo "=== $$t ==="; $$t || rc=1; done; \
 	echo "=== scripts/test_peer_height.py ==="; python3 scripts/test_peer_height.py ./indexerd || rc=1; \
 	echo "=== scripts/test_feefilter.py ==="; python3 scripts/test_feefilter.py ./indexerd || rc=1; \
 	echo "=== scripts/test_redial.py ==="; python3 scripts/test_redial.py ./indexerd || rc=1; \
+	echo "=== scripts/test_sync_stall.py ==="; python3 scripts/test_sync_stall.py ./indexerd-stalltest || rc=1; \
 	if [ $$rc -eq 0 ]; then echo "check: ALL PASSED"; else echo "check: FAILED"; fi; exit $$rc
 
 check-clean:
-	rm -f test_db test_sync test_codec test_serve test_reorg test_rollback test_relay
+	rm -f test_db test_sync test_codec test_serve test_reorg test_rollback test_relay indexerd-stalltest
 
 .PHONY: check check-clean
