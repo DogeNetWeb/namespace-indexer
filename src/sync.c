@@ -1741,19 +1741,86 @@ typedef struct {
     int64_t feefilter;                // peer's BIP133 feefilter (koinu/kB), 0 = none
     int  got_verack;                  // handshake done: feefilter is honoured only after this
     int  redial_fails;                // consecutive short/failed sessions (backoff exponent)
+    uint8_t *out; size_t out_len, out_off;  // queued outbound frames (serve_send)
+    time_t out_since;                 // last time the queue made progress (or became non-empty)
+    int  send_dead;                   // queue overflow / hard send error: drop at the next sweep
+    uint8_t *gd_rest; uint32_t gd_rest_n;   // getdata items (36 B each) deferred until the queue drains
 } SConn;
 static uint32_t redial_rnd(void) {
     uint32_t r = 0;
     if (getrandom(&r, sizeof r, GRND_NONBLOCK) != (ssize_t)sizeof r) r = (uint32_t)time(NULL) * 2654435761u;
     return r;
 }
+// ── serve sends: queued, never blocking the serve thread ─────────────────────
+// Serve fds used to get net_send → write_all, a BLOCKING write on the one
+// thread that runs every peer, the mesh gossip and the publish drain. A peer
+// that asks for data (getheaders/getdata/mempool…) and then never reads fills
+// its socket buffers and parked that write — and the whole serve plane — for
+// good. (PepeNet fixed the same class in 18a399f with a per-conn queue; this is
+// that design on DogeNet's blocking-fd serve loop.) Now every serve-plane send
+// appends one complete frame to the conn's queue and flushes with MSG_DONTWAIT;
+// the rest goes out on POLLOUT. Bounds: SERVE_OUT_MAX queued bytes (one
+// legal message + 64 KiB — any more and the peer isn't reading), and
+// SERVE_SEND_STALL_S with no write progress. Either marks the conn send_dead;
+// the loop drops it at the next sweep, never from inside a send (no
+// re-entrancy into dispatch/mesh callbacks). Frames are never torn: a frame is
+// queued whole or not at all. Wire bytes unchanged.
+#define SERVE_OUT_MAX      (SERVE_MSG_MAX + 24u + 64u * 1024u)
+#ifndef SERVE_SEND_STALL_S
+#define SERVE_SEND_STALL_S 120
+#endif
+// getdata replies are paced, not dropped: an item is only queued while ≤
+// SERVE_OUT_SOFT bytes are pending, so one more block (≤ SERVE_MSG_MAX) always
+// fits under SERVE_OUT_MAX. The remaining items wait in c->gd_rest and resume
+// on POLLOUT; the conn's input is not read meanwhile (ordering + backpressure,
+// the same effect the old blocking write had — minus wedging everyone else).
+#define SERVE_OUT_SOFT     (64u * 1024u)
+#define SERVE_PENDING(c)   ((c)->out_len - (c)->out_off)
+#ifdef MSG_NOSIGNAL
+#define SERVE_SEND_FLAGS (MSG_DONTWAIT | MSG_NOSIGNAL)
+#else
+#define SERVE_SEND_FLAGS MSG_DONTWAIT
+#endif
+static int serve_out_flush(SConn *c) {
+    while (c->fd >= 0 && !c->send_dead && c->out_off < c->out_len) {
+        ssize_t w = send(c->fd, c->out + c->out_off, c->out_len - c->out_off, SERVE_SEND_FLAGS);
+        if (w > 0) { c->out_off += (size_t)w; c->out_since = time(NULL); continue; }
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        c->send_dead = 1; break;                       // hard error: drop at the sweep
+    }
+    if (c->out_off >= c->out_len) c->out_off = c->out_len = 0;
+    return !c->send_dead;
+}
+static int serve_send(SConn *c, const uint8_t magic[4], const char *cmd, const uint8_t *payload, uint32_t len) {
+    if (c->fd < 0 || c->send_dead) return 0;
+    if (c->out_off) {                                  // compact the sent prefix
+        memmove(c->out, c->out + c->out_off, c->out_len - c->out_off);
+        c->out_len -= c->out_off; c->out_off = 0;
+    }
+    size_t need = c->out_len + 24u + len;
+    if (need > SERVE_OUT_MAX) { c->send_dead = 1; return 0; }   // peer isn't reading
+    uint8_t *nb = realloc(c->out, need);
+    if (!nb) { c->send_dead = 1; return 0; }
+    c->out = nb;
+    if (c->out_len == 0) c->out_since = time(NULL);    // stall clock starts with a non-empty queue
+    uint8_t *h = c->out + c->out_len; memset(h, 0, 24); memcpy(h, magic, 4);
+    strncpy((char *)h + 4, cmd, 12);
+    h[16] = (uint8_t)len; h[17] = (uint8_t)(len >> 8); h[18] = (uint8_t)(len >> 16); h[19] = (uint8_t)(len >> 24);
+    uint8_t ck[32]; idx_sha256d(payload ? payload : (const uint8_t *)"", len, ck); memcpy(h + 20, ck, 4);
+    if (len) memcpy(h + 24, payload, len);
+    c->out_len = need;
+    return serve_out_flush(c);
+}
 // the mesh send fn handed to peer_up: emit a dn* command on this peer's conn
 static void serve_mesh_send(void *peer, const char *cmd, const uint8_t *pay, size_t n) {
     SConn *sc = (SConn *)peer;
-    if (sc->fd >= 0) net_send(sc->fd, sc->magic, cmd, pay, (uint32_t)n);
+    if (sc->fd >= 0) serve_send(sc, sc->magic, cmd, pay, (uint32_t)n);
 }
 static void sconn_reset(SConn *c) {   // wipe transient state, keep outbound redial info
     free(c->buf);
+    free(c->out); c->out = NULL; c->out_len = c->out_off = 0; c->out_since = 0; c->send_dead = 0;
+    free(c->gd_rest); c->gd_rest = NULL; c->gd_rest_n = 0;
     int ob = c->outbound, ms = c->mesh_seat, cs = c->chain_seat; char host[80], hip[46]; uint16_t rp = c->rport;
     time_t now = time(NULL);
     // backoff: a session that never came up or died young grows the delay;
@@ -1882,8 +1949,8 @@ static int addr_entry(uint8_t *out, uint32_t *o, uint32_t cap,
     return 1;
 }
 
-static void serve_send_version(int fd, const Coin *coin, int64_t our_height, int64_t services) {
-    uint8_t v[256]; int o = 0;
+static int serve_build_version(uint8_t v[256], int64_t our_height, int64_t services) {
+    int o = 0;
     for (int i = 0; i < 4; i++) v[o++] = (70015 >> (8*i)) & 0xff;
     for (int i = 0; i < 8; i++) v[o++] = (services >> (8*i)) & 0xff;
     int64_t now = (int64_t)time(NULL); for (int i = 0; i < 8; i++) v[o++] = (now >> (8*i)) & 0xff;
@@ -1894,6 +1961,11 @@ static void serve_send_version(int fd, const Coin *coin, int64_t our_height, int
     v[o++] = (uint8_t)ual; memcpy(v + o, idx_sync_agent, ual); o += (int)ual;
     for (int i = 0; i < 4; i++) v[o++] = (our_height >> (8*i)) & 0xff;
     v[o++] = 1;                                                      // relay: we accept tx invs (mempool)
+    return o;
+}
+// blocking-fd paths (serve_dial's own handshake, crawl probes) — not a serve conn
+static void serve_send_version(int fd, const Coin *coin, int64_t our_height, int64_t services) {
+    uint8_t v[256]; int o = serve_build_version(v, our_height, services);
     net_send(fd, coin->magic, "version", v, (uint32_t)o);
 }
 
@@ -1924,7 +1996,7 @@ static void serve_send_dnaddr(SConn *c, const Coin *coin, sqlite3 *db,
         if (self && *self && !strcmp(pool[i], self)) continue;   // don't echo self twice
         put += addr_entry(out, &o, 3 + SERVE_DNADDR_MAX*30u, pool[i], 0, now);
     }
-    net_send(c->fd, coin->magic, "dnaddr", out, o);
+    serve_send(c, coin->magic, "dnaddr", out, o);
     free(out);
 }
 
@@ -1936,15 +2008,54 @@ static void serve_send_dnaddr(SConn *c, const Coin *coin, sqlite3 *db,
 // chain port → reads the "/dogenet-" subver → the mesh finds itself. Gated
 // on listening (port) + a learned external ip (version.addr_recv); actually
 // REACHING the announced port is still the operator's port-forward.
-static void serve_announce_self(const SConn *c, const Coin *coin,
+static void serve_announce_self(SConn *c, const Coin *coin,
                                 const char *self, int64_t services) {
     uint8_t out[3 + 30];
     int vo = 0;
     put_varint(out, &vo, 1);
     uint32_t o = (uint32_t)vo;
     if (!addr_entry(out, &o, sizeof out, self, services, (int64_t)time(NULL))) return;
-    net_send(c->fd, coin->magic, "addr", out, o);
+    serve_send(c, coin->magic, "addr", out, o);
     fprintf(stderr, "serve: announced self %s to %s\n", self, c->peer);
+}
+
+// serve a run of getdata inventory items (36 B each); stops early — stashing
+// the rest in c->gd_rest — once the send queue is above SERVE_OUT_SOFT.
+static void serve_getdata_items(SConn *c, const Coin *coin, ServeStore *ss, const uint8_t *items, uint32_t n) {
+    uint8_t *nf = NULL; uint32_t nfn = 0;               // held-back txs → notfound
+    uint32_t i = 0;
+    for (; i < n && c->fd >= 0 && !c->send_dead; i++) {
+        if (SERVE_PENDING(c) > SERVE_OUT_SOFT) break;   // pace: resume on POLLOUT
+        const uint8_t *it = items + (size_t)i * 36;
+        uint32_t type = it[0] | (it[1]<<8) | (it[2]<<16) | ((uint32_t)it[3]<<24);
+        if (type == 2 && ss) {                         // block (type 2) — from the serve store
+            uint8_t *raw; size_t rl;
+            if (serve_store_block(ss, it + 4, &raw, &rl)) {
+                serve_send(c, coin->magic, "block", raw, (uint32_t)rl);
+                free(raw);
+            }
+        } else if (type == 1) {                        // tx (type 1) — from the mempool
+            size_t rl; uint8_t *raw = mempool_get_copy(it + 4, &rl);
+            if (!raw) continue;
+            if (feefilter_allows(c->feefilter, mempool_feerate(it + 4)))
+                serve_send(c, coin->magic, "tx", raw, (uint32_t)rl);
+            else {                                     // known below its feefilter
+                if (!nf) nf = malloc(9 + (size_t)n * 36);
+                if (nf) { memcpy(nf + 9 + (size_t)nfn * 36, it, 36); nfn++; }
+            }
+            free(raw);
+        }
+    }
+    if (nf && nfn) {
+        uint8_t vi[9]; int vo = 0; put_varint(vi, &vo, nfn);
+        memmove(nf + 9 - vo, vi, (size_t)vo);
+        serve_send(c, coin->magic, "notfound", nf + 9 - vo, (uint32_t)(vo + nfn * 36));
+    }
+    free(nf);
+    // stash (or clear) the unserved tail; items may alias c->gd_rest
+    uint8_t *rest = NULL; uint32_t rn = (c->fd >= 0 && !c->send_dead && i < n) ? n - i : 0;
+    if (rn) { rest = malloc((size_t)rn * 36); if (rest) memcpy(rest, items + (size_t)i * 36, (size_t)rn * 36); else rn = 0; }
+    free(c->gd_rest); c->gd_rest = rest; c->gd_rest_n = rn;
 }
 
 static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db, ServeStore *ss,
@@ -1972,10 +2083,11 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
               } } }
         if (!c->sent_ver) {
             int64_t h = 0; uint8_t tip[32]; idx_db_load_sync(db, &h, tip);
-            serve_send_version(c->fd, coin, h, services);
+            { uint8_t v[256]; int vo = serve_build_version(v, h, services);
+              serve_send(c, coin->magic, "version", v, (uint32_t)vo); }
             c->sent_ver = 1;
         }
-        net_send(c->fd, coin->magic, "verack", NULL, 0);
+        serve_send(c, coin->magic, "verack", NULL, 0);
         c->up = 1; if (!c->up_at) c->up_at = time(NULL);
         // a marked peer + a mesh embedder → hand it up so the carrier gossips
         if (mesh && mesh->peer_up && !c->mesh_handle && AGENT_MARKED(c->agent))
@@ -1983,7 +2095,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         // overlay discovery (mesh-independent): solicit this marked peer's
         // overlay peer list, once per connection
         if (!c->dn_asked && AGENT_MARKED(c->agent)) {
-            net_send(c->fd, coin->magic, "dngetaddr", NULL, 0);
+            serve_send(c, coin->magic, "dngetaddr", NULL, 0);
             c->dn_asked = 1;
         }
         // self-announcement (see serve_announce_self) — once per connection
@@ -2006,7 +2118,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
     } else if (!strncmp(cmd, "dn", 2) && cmd[2] && mesh && mesh->peer_msg && c->mesh_handle) {
         mesh->peer_msg(mesh->ud, c->mesh_handle, cmd + 2, pl, (int)pln);   // carrier dn* command
     } else if (!strcmp(cmd, "ping")) {
-        net_send(c->fd, coin->magic, "pong", pl, pln);
+        serve_send(c, coin->magic, "pong", pl, pln);
     } else if (!strcmp(cmd, "getaddr")) {
         IdxPeerRow *rows = malloc(sizeof(IdxPeerRow) * 1000);
         if (!rows) return;
@@ -2020,7 +2132,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         if (*self && put < total) put += addr_entry(out, &o, 3 + 1001u*30, self, 0, now);
         for (int i = 0; i < n && put < total; i++)
             put += addr_entry(out, &o, 3 + 1001u*30, rows[i].addr, rows[i].services, rows[i].last_seen);
-        net_send(c->fd, coin->magic, "addr", out, o);
+        serve_send(c, coin->magic, "addr", out, o);
         free(out); free(rows);
     } else if (!strcmp(cmd, "addr")) {
         addr_harvest(db, pl, pln, 0);
@@ -2039,7 +2151,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         int vo = 0; put_varint(out, &vo, (uint64_t)nh);
         uint32_t oo = (uint32_t)vo;
         for (int i = 0; i < nh; i++) { memcpy(out + oo, hbuf + i * 80, 80); oo += 80; out[oo++] = 0x00; }  // 0 tx count
-        if (nh) net_send(c->fd, coin->magic, "headers", out, oo);
+        if (nh) serve_send(c, coin->magic, "headers", out, oo);
         free(out);
     } else if (!strcmp(cmd, "getblocks") && ss) {
         // the sync path's forward walk (getblocks → inv → getdata → block) —
@@ -2071,7 +2183,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
                     out[oo++] = 2; out[oo++] = 0; out[oo++] = 0; out[oo++] = 0;   // MSG_BLOCK
                     memcpy(out + oo, hs[i], 32); oo += 32;
                 }
-                net_send(c->fd, coin->magic, "inv", out, oo);
+                serve_send(c, coin->magic, "inv", out, oo);
                 free(out);
             }
         }
@@ -2081,33 +2193,9 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         uint32_t o = 0; uint64_t cnt = pl[o++];
         if (cnt == 0xFD) { if (pln < 3) return; cnt = pl[o] | (pl[o+1] << 8); o += 2; }
         else if (cnt >= 0xFE) return;
-        uint8_t *nf = NULL; uint32_t nfn = 0;               // held-back txs → notfound
-        for (uint64_t i = 0; i < cnt && o + 36 <= pln; i++, o += 36) {
-            uint32_t type = pl[o] | (pl[o+1]<<8) | (pl[o+2]<<16) | ((uint32_t)pl[o+3]<<24);
-            if (type == 2 && ss) {                         // block (type 2) — from the serve store
-                uint8_t *raw; size_t rl;
-                if (serve_store_block(ss, pl + o + 4, &raw, &rl)) {
-                    net_send(c->fd, coin->magic, "block", raw, (uint32_t)rl);
-                    free(raw);
-                }
-            } else if (type == 1) {                        // tx (type 1) — from the mempool
-                size_t rl; uint8_t *raw = mempool_get_copy(pl + o + 4, &rl);
-                if (!raw) continue;
-                if (feefilter_allows(c->feefilter, mempool_feerate(pl + o + 4)))
-                    net_send(c->fd, coin->magic, "tx", raw, (uint32_t)rl);
-                else {                                     // known below its feefilter
-                    if (!nf) nf = malloc(9 + (size_t)(pln / 36 + 1) * 36);
-                    if (nf) { memcpy(nf + 9 + (size_t)nfn * 36, pl + o, 36); nfn++; }
-                }
-                free(raw);
-            }
-        }
-        if (nf && nfn) {
-            uint8_t vi[9]; int vo = 0; put_varint(vi, &vo, nfn);
-            memmove(nf + 9 - vo, vi, (size_t)vo);
-            net_send(c->fd, coin->magic, "notfound", nf + 9 - vo, (uint32_t)(vo + nfn * 36));
-        }
-        free(nf);
+        uint64_t have = (pln - o) / 36;
+        if (cnt > have) cnt = have;
+        serve_getdata_items(c, coin, ss, pl + o, (uint32_t)cnt);
     } else if (!strcmp(cmd, "inv")) {
         // a peer advertises inventory. Tx invs (type 1) we don't have → pull
         // for the mempool. Block invs (type 2) we don't know → pull into the
@@ -2138,7 +2226,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
             uint8_t getd[3 + 36 * (128 + 16)]; int go = 0; put_varint(getd, &go, (uint64_t)(nreq + nblk));
             for (int i = 0; i < nreq; i++) { getd[go++]=1; getd[go++]=0; getd[go++]=0; getd[go++]=0; memcpy(getd + go, want[i], 32); go += 32; }
             for (int i = 0; i < nblk; i++) { getd[go++]=2; getd[go++]=0; getd[go++]=0; getd[go++]=0; memcpy(getd + go, wblk[i], 32); go += 32; }
-            net_send(c->fd, coin->magic, "getdata", getd, (uint32_t)go);
+            serve_send(c, coin->magic, "getdata", getd, (uint32_t)go);
         }
     } else if (!strcmp(cmd, "block")) {
         // a block body off a serve conn (answer to the inv-pull above, or an
@@ -2183,7 +2271,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
             int64_t fr = mempool_feerate(txid);
             for (int i = 0; i < SERVE_MAX_CONN; i++) {
                 SConn *o = &conns[i];
-                if (o->fd >= 0 && o->up && o != c && feefilter_allows(o->feefilter, fr)) net_send(o->fd, o->magic ? o->magic : coin->magic, "inv", inv, (uint32_t)io);
+                if (o->fd >= 0 && o->up && o != c && feefilter_allows(o->feefilter, fr)) serve_send(o, o->magic ? o->magic : coin->magic, "inv", inv, (uint32_t)io);
             }
         }
     } else if (!strcmp(cmd, "mempool")) {
@@ -2197,7 +2285,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
             uint8_t *inv = malloc(3 + n * 36);
             if (inv) { int io = 0; put_varint(inv, &io, (uint64_t)n);
                 for (size_t i = 0; i < n; i++) { inv[io++]=1; inv[io++]=0; inv[io++]=0; inv[io++]=0; memcpy(inv + io, ids[i], 32); io += 32; }
-                net_send(c->fd, coin->magic, "inv", inv, (uint32_t)io); free(inv); }
+                serve_send(c, coin->magic, "inv", inv, (uint32_t)io); free(inv); }
         }
         free(ids);
     }
@@ -2494,7 +2582,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                           if (pc->fd < 0 || !pc->up || !AGENT_MARKED(pc->agent)) continue;
                           time_t cad = (pc->peer_h > pt + 2) ? 5 : 60;
                           if (now - pc->last_pull < cad) continue;
-                          net_send(pc->fd, coin->magic, "getblocks", gb, (uint32_t)go);
+                          serve_send(pc, coin->magic, "getblocks", gb, (uint32_t)go);
                           pc->last_pull = now;
                       }
                   }
@@ -2515,7 +2603,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                         }
                         for (int i = 0; i < SERVE_MAX_CONN; i++)
                             if (conns[i].fd >= 0 && conns[i].up)
-                                net_send(conns[i].fd, coin->magic, "inv", out, oo);
+                                serve_send(&conns[i], coin->magic, "inv", out, oo);
                     }
                 }
                 announced_tip = st;
@@ -2546,7 +2634,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
             } else if (idle > SERVE_PING_S && now - c->last_ping > SERVE_PING_S) {
                 uint8_t pn[8]; uint64_t nn = (uint64_t)now ^ ((uint64_t)i << 48);
                 for (int b = 0; b < 8; b++) pn[b] = (uint8_t)(nn >> (8 * b));
-                net_send(c->fd, coin->magic, "ping", pn, 8);
+                serve_send(c, coin->magic, "ping", pn, 8);
                 c->last_ping = now;      // any reply (pong or otherwise) feeds last_rx
             }
         }
@@ -2658,7 +2746,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                 if (mesh && mesh->peer_up && !c->mesh_handle && is_dn)
                     c->mesh_handle = mesh->peer_up(mesh->ud, c, serve_mesh_send);
                 if (!c->dn_asked && is_dn) {          // solicit its overlay peer list
-                    net_send(fd, coin->magic, "dngetaddr", NULL, 0);
+                    serve_send(c, coin->magic, "dngetaddr", NULL, 0);
                     c->dn_asked = 1;
                 }
                 // self-announcement (see serve_announce_self) — once per connection
@@ -2670,10 +2758,28 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
         }
         if (mesh && mesh->tick) mesh->tick(mesh->ud);
 
+        // send-side liveness: a conn whose queue overflowed / hit a hard error,
+        // or made no write progress for SERVE_SEND_STALL_S, is not reading — drop it
+        { time_t tn = time(NULL);
+          for (int i = 0; i < SERVE_MAX_CONN; i++) {
+              SConn *c = &conns[i];
+              if (c->fd < 0) continue;
+              int stalled = c->out_len > c->out_off && tn - c->out_since > SERVE_SEND_STALL_S;
+              if (c->send_dead || stalled) {
+                  fprintf(stderr, "serve: %s not reading (%s, %zu bytes queued) — dropping\n",
+                          c->peer[0] ? c->peer : "(peer)", c->send_dead ? "send queue full/error" : "send stalled",
+                          c->out_len - c->out_off);
+                  serve_drop(c, mesh);
+              }
+          } }
         struct pollfd pfd[SERVE_MAX_CONN + 1]; int map[SERVE_MAX_CONN + 1]; int np = 0;
         if (lfd >= 0) { pfd[np].fd = lfd; pfd[np].events = POLLIN; map[np] = -1; np++; }
         for (int i = 0; i < SERVE_MAX_CONN; i++)
-            if (conns[i].fd >= 0) { pfd[np].fd = conns[i].fd; pfd[np].events = POLLIN; map[np] = i; np++; }
+            if (conns[i].fd >= 0) {
+                pfd[np].fd = conns[i].fd;
+                pfd[np].events = (conns[i].gd_rest_n ? 0 : POLLIN) | (conns[i].out_len > conns[i].out_off ? POLLOUT : 0);
+                map[np] = i; np++;
+            }
         if (poll(pfd, np, 1000) <= 0) continue;
         int start = 0;
         if (lfd >= 0 && (pfd[0].revents & POLLIN)) {
@@ -2712,24 +2818,41 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
         }
         if (lfd >= 0) start = 1;
         for (int k = start; k < np; k++) {
-            if (map[k] < 0 || !(pfd[k].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            if (map[k] < 0) continue;
             SConn *c = &conns[map[k]];
-            uint8_t chunk[8192];
-            ssize_t r = recv(c->fd, chunk, sizeof chunk, 0);
-            if (r <= 0) { serve_drop(c, mesh); continue; }
-            c->last_rx = time(NULL);
-            size_t need = c->len + (size_t)r;
-            if (need > SERVE_MSG_MAX + 1024u) { serve_drop(c, mesh); continue; }
-            if (need > c->cap) {
-                size_t nc = c->cap ? c->cap : 16384;
-                while (nc < need) nc *= 2;
-                uint8_t *nb = realloc(c->buf, nc);
-                if (!nb) { serve_drop(c, mesh); continue; }
-                c->buf = nb; c->cap = nc;
+            if (c->fd != pfd[k].fd) continue;               // slot dropped/reused this round
+            int parse = 0;
+            if (pfd[k].revents & POLLOUT) {
+                serve_out_flush(c);
+                if (c->gd_rest_n && !c->send_dead && SERVE_PENDING(c) <= SERVE_OUT_SOFT) {
+                    serve_getdata_items(c, coin, ss, c->gd_rest, c->gd_rest_n);
+                    if (!c->gd_rest_n && c->len >= 24) parse = 1;   // resume buffered requests
+                }
             }
-            memcpy(c->buf + c->len, chunk, (size_t)r); c->len += (size_t)r;
+            if (c->gd_rest_n) {                             // paced: input not read meanwhile
+                if (pfd[k].revents & (POLLHUP | POLLERR)) serve_drop(c, mesh);
+                continue;
+            }
+            if (pfd[k].revents & (POLLIN | POLLHUP | POLLERR)) {
+                uint8_t chunk[8192];
+                ssize_t r = recv(c->fd, chunk, sizeof chunk, 0);
+                if (r <= 0) { serve_drop(c, mesh); continue; }
+                c->last_rx = time(NULL);
+                size_t need = c->len + (size_t)r;
+                if (need > SERVE_MSG_MAX + 1024u) { serve_drop(c, mesh); continue; }
+                if (need > c->cap) {
+                    size_t nc = c->cap ? c->cap : 16384;
+                    while (nc < need) nc *= 2;
+                    uint8_t *nb = realloc(c->buf, nc);
+                    if (!nb) { serve_drop(c, mesh); continue; }
+                    c->buf = nb; c->cap = nc;
+                }
+                memcpy(c->buf + c->len, chunk, (size_t)r); c->len += (size_t)r;
+                parse = 1;
+            }
+            if (!parse) continue;
             size_t off = 0; int dead = 0;
-            while (c->len - off >= 24) {
+            while (c->len - off >= 24 && !c->gd_rest_n) {
                 uint8_t *h = c->buf + off;
                 if (memcmp(h, coin->magic, 4) != 0) { serve_drop(c, mesh); dead = 1; break; }
                 uint32_t plen = (uint32_t)h[16] | (uint32_t)h[17] << 8 | (uint32_t)h[18] << 16 | (uint32_t)h[19] << 24;

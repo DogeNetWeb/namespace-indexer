@@ -116,11 +116,14 @@ test_serve: src/test_serve.c src/serve_store.c src/serve_store.h
 test_relay: $(TEST_SRCS) src/test_relay.c src/relay_policy.h $(SECPLIB)
 	$(CC) $(CFLAGS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ $(TEST_SRCS) src/test_relay.c $(LIBS)
 
-# indexerd-stalltest: indexerd with SHORT receive deadlines (batch 6 s, weigh
-# 4 s, getblocks round 2 s, handshake 3 s) for scripts/test_sync_stall.py — the
-# slow-loris regression. Same sources; only the four #ifndef deadlines differ.
+# indexerd-stalltest: indexerd with SHORT deadlines (batch 6 s, weigh 4 s,
+# getblocks round 2 s, handshake 3 s, serve send stall 4 s) for
+# scripts/test_sync_stall.py (the sync slow-loris regression) and
+# scripts/test_serve_noread.py (a serve peer that never reads). Same sources;
+# only the five #ifndef deadlines differ.
 STALL_DEFS := -DIDX_SYNC_BATCH_DEADLINE_S=6 -DIDX_SYNC_WEIGH_DEADLINE_S=4 \
-              -DIDX_SYNC_ROUND_MS=2000 -DIDX_NET_SHAKE_DEADLINE_MS=3000
+              -DIDX_SYNC_ROUND_MS=2000 -DIDX_NET_SHAKE_DEADLINE_MS=3000 \
+              -DSERVE_SEND_STALL_S=4
 indexerd-stalltest: $(ALL_SRCS) $(wildcard src/*.h) $(wildcard $(SMDIR)/*.h) $(SECPLIB)
 	$(CC) $(CFLAGS) $(STALL_DEFS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ $(ALL_SRCS) $(LIBS)
 
@@ -135,6 +138,7 @@ check: test_db test_sync test_codec test_serve test_reorg test_rollback test_ret
 	echo "=== scripts/test_feefilter.py ==="; python3 scripts/test_feefilter.py ./indexerd || rc=1; \
 	echo "=== scripts/test_redial.py ==="; python3 scripts/test_redial.py ./indexerd || rc=1; \
 	echo "=== scripts/test_sync_stall.py ==="; python3 scripts/test_sync_stall.py ./indexerd-stalltest || rc=1; \
+	echo "=== scripts/test_serve_noread.py ==="; python3 scripts/test_serve_noread.py ./indexerd-stalltest || rc=1; \
 	if [ $$rc -eq 0 ]; then echo "check: ALL PASSED"; else echo "check: FAILED"; fi; exit $$rc
 
 check-clean:
