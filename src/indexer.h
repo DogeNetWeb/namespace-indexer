@@ -182,6 +182,9 @@ int    idx_serve_peer_exempt(void *peer);
 // non-NULL — carry carrier gossip as
 // dn* commands over every pepenet connection. Blocks until *stop; run on a
 // thread. Returns 0, -1 on bind failure.
+// Optional: read end of a non-blocking pipe; a byte written to it wakes the
+// serve loop so mesh->tick runs at once (-1 = none, the default).
+extern int idx_serve_wake_fd;
 int idx_serve(const char *coin, const char *dbpath, uint16_t port,
               const char *dial_peers, volatile int *stop, const IdxMeshHooks *mesh);
 

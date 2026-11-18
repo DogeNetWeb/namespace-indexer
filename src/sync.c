@@ -2499,6 +2499,12 @@ static void chain_topup(SConn *conns, sqlite3 *db, const Coin *coin, const char 
 // The chain-wire presence (indexer.h). port 0 = dial-only. `dial_peers` =
 // comma host:port list kept connected. `mesh` non-NULL carries carrier gossip
 // as dn* commands on pepenet peers.
+// Optional wake pipe (read end, O_NONBLOCK) a host may set before idx_serve
+// starts: a byte written to it ends the serve loop's 1 s poll at once, so the
+// next pass runs mesh->tick now (dnsd lazy mode: a query just queued a zone
+// fetch). -1 = none (default; behaviour unchanged). Local only.
+int idx_serve_wake_fd = -1;
+
 int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
               const char *dial_peers, volatile int *stop, const IdxMeshHooks *mesh) {
     const Coin *coin = coin_by_name(coinname); if (!coin) return -1;
@@ -2801,7 +2807,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                   serve_drop(c, mesh);
               }
           } }
-        struct pollfd pfd[SERVE_MAX_CONN + 1]; int map[SERVE_MAX_CONN + 1]; int np = 0;
+        struct pollfd pfd[SERVE_MAX_CONN + 2]; int map[SERVE_MAX_CONN + 2]; int np = 0;
         if (lfd >= 0) { pfd[np].fd = lfd; pfd[np].events = POLLIN; map[np] = -1; np++; }
         for (int i = 0; i < SERVE_MAX_CONN; i++)
             if (conns[i].fd >= 0) {
@@ -2809,7 +2815,12 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                 pfd[np].events = (conns[i].gd_rest_n ? 0 : POLLIN) | (conns[i].out_len > conns[i].out_off ? POLLOUT : 0);
                 map[np] = i; np++;
             }
+        int wk = -1;                                     // optional host wake pipe (last; map -2)
+        if (idx_serve_wake_fd >= 0) { wk = np; pfd[np].fd = idx_serve_wake_fd; pfd[np].events = POLLIN; map[np] = -2; np++; }
         if (poll(pfd, np, 1000) <= 0) continue;
+        if (wk >= 0 && (pfd[wk].revents & POLLIN)) {      // drain; the next pass runs mesh->tick
+            char wb[64]; while (read(idx_serve_wake_fd, wb, sizeof wb) > 0) {}
+        }
         int start = 0;
         if (lfd >= 0 && (pfd[0].revents & POLLIN)) {
             int cfd = accept(lfd, NULL, NULL);
