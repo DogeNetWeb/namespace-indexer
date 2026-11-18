@@ -163,6 +163,15 @@ typedef struct {
     void   *ud;
 } IdxMeshHooks;
 
+// Transport hooks for a mesh carrier (local policy only, nothing on the wire);
+// `peer` is the pointer idx_serve passed to peer_up. Serve thread only.
+//   pending: bytes queued for that conn but not yet written to its socket
+//   kick:    close that conn at the next sweep (logged with `why`)
+//   exempt:  1 for loopback/unknown-address peers and outbound seats we dialed
+size_t idx_serve_peer_pending(void *peer);
+void   idx_serve_peer_kick(void *peer, const char *why);
+int    idx_serve_peer_exempt(void *peer);
+
 // The chain-wire presence (peer-discovery slice 3). Listen on `port` (0 =
 // dial-only, no bind — for a NAT'd node), maintain outbound connections to
 // `dial_peers` (comma host:port list, may be NULL), version-handshake

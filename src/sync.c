@@ -1752,6 +1752,7 @@ typedef struct {
     uint8_t *out; size_t out_len, out_off;  // queued outbound frames (serve_send)
     time_t out_since;                 // last time the queue made progress (or became non-empty)
     int  send_dead;                   // queue overflow / hard send error: drop at the next sweep
+    int  mesh_kick;                   // the mesh carrier asked to close this conn (L6): drop at the sweep
     uint8_t *gd_rest; uint32_t gd_rest_n;   // getdata items (36 B each) deferred until the queue drains
 } SConn;
 static uint32_t redial_rnd(void) {
@@ -1825,9 +1826,28 @@ static void serve_mesh_send(void *peer, const char *cmd, const uint8_t *pay, siz
     SConn *sc = (SConn *)peer;
     if (sc->fd >= 0) serve_send(sc, sc->magic, cmd, pay, (uint32_t)n);
 }
+// transport hooks for the mesh carrier (indexer.h): `peer` is the pointer
+// handed to peer_up; valid until peer_down. All three run on the serve thread.
+size_t idx_serve_peer_pending(void *peer) {
+    SConn *sc = (SConn *)peer;
+    return sc->fd >= 0 ? (size_t)SERVE_PENDING(sc) : 0;
+}
+void idx_serve_peer_kick(void *peer, const char *why) {
+    SConn *sc = (SConn *)peer;
+    if (sc->fd < 0 || sc->mesh_kick) return;
+    sc->mesh_kick = 1;
+    fprintf(stderr, "serve: %s dropped by the mesh carrier (%s)\n",
+            sc->peer[0] ? sc->peer : "(peer)", why ? why : "-");
+}
+int idx_serve_peer_exempt(void *peer) {
+    SConn *sc = (SConn *)peer;
+    if (sc->outbound) return 1;                      // a seat we chose to dial
+    return !strncmp(sc->peer, "127.", 4) || !strncmp(sc->peer, "::1", 3) || !sc->peer[0];
+}
 static void sconn_reset(SConn *c) {   // wipe transient state, keep outbound redial info
     free(c->buf);
     free(c->out); c->out = NULL; c->out_len = c->out_off = 0; c->out_since = 0; c->send_dead = 0;
+    c->mesh_kick = 0;
     free(c->gd_rest); c->gd_rest = NULL; c->gd_rest_n = 0;
     int ob = c->outbound, ms = c->mesh_seat, cs = c->chain_seat; char host[80], hip[46]; uint16_t rp = c->rport;
     time_t now = time(NULL);
@@ -2773,6 +2793,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
               SConn *c = &conns[i];
               if (c->fd < 0) continue;
               int stalled = c->out_len > c->out_off && tn - c->out_since > SERVE_SEND_STALL_S;
+              if (c->mesh_kick && !c->send_dead && !stalled) { serve_drop(c, mesh); continue; }
               if (c->send_dead || stalled) {
                   fprintf(stderr, "serve: %s not reading (%s, %zu bytes queued) — dropping\n",
                           c->peer[0] ? c->peer : "(peer)", c->send_dead ? "send queue full/error" : "send stalled",
