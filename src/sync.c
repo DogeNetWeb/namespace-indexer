@@ -1754,6 +1754,7 @@ typedef struct {
     int  send_dead;                   // queue overflow / hard send error: drop at the next sweep
     int  mesh_kick;                   // the mesh carrier asked to close this conn (L6): drop at the sweep
     uint8_t *gd_rest; uint32_t gd_rest_n;   // getdata items (36 B each) deferred until the queue drains
+    int64_t peer_svc;                 // peer's version.services (0 till its version is seen)
 } SConn;
 static uint32_t redial_rnd(void) {
     uint32_t r = 0;
@@ -1839,6 +1840,9 @@ void idx_serve_peer_kick(void *peer, const char *why) {
     fprintf(stderr, "serve: %s dropped by the mesh carrier (%s)\n",
             sc->peer[0] ? sc->peer : "(peer)", why ? why : "-");
 }
+int64_t idx_serve_peer_services(void *peer) {
+    return ((SConn *)peer)->peer_svc;
+}
 int idx_serve_peer_exempt(void *peer) {
     SConn *sc = (SConn *)peer;
     if (sc->outbound) return 1;                      // a seat we chose to dial
@@ -1862,7 +1866,7 @@ static void sconn_reset(SConn *c) {   // wipe transient state, keep outbound red
     c->outbound = ob; if (ob) { c->mesh_seat = ms; c->chain_seat = cs; memcpy(c->host, host, sizeof c->host); memcpy(c->hip, hip, sizeof c->hip); c->rport = rp;
         c->redial_fails = rf; c->redial_at = now + (time_t)redial_delay(rf, redial_rnd()); }
     else c->redial_fails = 0;
-    c->up_at = 0; c->feefilter = 0; c->got_verack = 0;
+    c->up_at = 0; c->feefilter = 0; c->got_verack = 0; c->peer_svc = 0;
 }
 // close + notify the mesh (peer_down) if this was a live mesh peer
 static void serve_drop(SConn *c, const IdxMeshHooks *mesh) {
@@ -2096,6 +2100,10 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
             unsigned a = pl[40];
             if (a && a != 127 && a != 10)
                 snprintf(self, 80, "%u.%u.%u.%u:%u", pl[40], pl[41], pl[42], pl[43], port);
+        }
+        if (pln >= 12) {                                 // services (DOGENET_SVC_LAZY etc.)
+            uint64_t sv = 0; for (int b = 0; b < 8; b++) sv |= (uint64_t)pl[4 + b] << (8 * b);
+            c->peer_svc = (int64_t)sv;
         }
         // capture the peer's subver (agent) — "/dogenet-" marks a mesh peer —
         // and its claimed start_height (the varstr's tail), the serve plane's
@@ -2505,6 +2513,10 @@ static void chain_topup(SConn *conns, sqlite3 *db, const Coin *coin, const char 
 // fetch). -1 = none (default; behaviour unchanged). Local only.
 int idx_serve_wake_fd = -1;
 
+// Extra version.services bits a host ORs in before idx_serve starts (dnsd
+// --lazy sets IDX_SVC_DOGENET_LAZY). 0 = unchanged. Old peers ignore unknown bits.
+int64_t idx_serve_extra_services = 0;
+
 int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
               const char *dial_peers, volatile int *stop, const IdxMeshHooks *mesh) {
     const Coin *coin = coin_by_name(coinname); if (!coin) return -1;
@@ -2541,7 +2553,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                           (int)(slash - dbpath), dbpath, coinname);
       else snprintf(serve_path, sizeof serve_path, "serve-%s.db", coinname); }
     ServeStore *ss = serve_store_open(serve_path);
-    int64_t services = (ss && serve_store_tip(ss) >= 0) ? (1LL << 10) : 0;
+    int64_t services = ((ss && serve_store_tip(ss) >= 0) ? (1LL << 10) : 0) | idx_serve_extra_services;
     int64_t our_h = 0; { uint8_t tip[32]; idx_db_load_sync(db, &our_h, tip); }
     if (port) fprintf(stderr, "serve: listening on 0.0.0.0:%u (agent %s, services 0x%llx)\n",
                       port, idx_sync_agent, (unsigned long long)services);
@@ -2765,6 +2777,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                     continue;
                 }
                 snprintf(c->agent, sizeof c->agent, "%s", agent);
+                c->peer_svc = psvc;
                 int is_dn = AGENT_MARKED(agent);
                 // persist the handshake so a restart re-seats this peer from memory
                 idx_db_peer_seen(db, c->peer, psvc, agent, (int64_t)now);

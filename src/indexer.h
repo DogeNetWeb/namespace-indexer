@@ -171,6 +171,14 @@ typedef struct {
 size_t idx_serve_peer_pending(void *peer);
 void   idx_serve_peer_kick(void *peer, const char *why);
 int    idx_serve_peer_exempt(void *peer);
+//   services: the peer's version.services as received (0 until seen)
+int64_t idx_serve_peer_services(void *peer);
+
+// version.services bit a DogeNet LAZY node advertises (bit 24, the Bitcoin-
+// lineage experimental range 24..31; Dogecoin Core and old DogeNet ignore it).
+// Peers that see it stop paging anti-entropy inventory to that link.
+#define IDX_SVC_DOGENET_LAZY (1LL << 24)
+extern int64_t idx_serve_extra_services;   // ORed into our advertised services
 
 // The chain-wire presence (peer-discovery slice 3). Listen on `port` (0 =
 // dial-only, no bind — for a NAT'd node), maintain outbound connections to
