@@ -657,6 +657,26 @@ static void sec_peer_height(const char *dir) {
       CHECK(idx_peer_height_note(d2, 500, 1000, 1) == 900, "load-seed: note 500 keeps in-memory best at 900");
       CHECK(idx_db_get_peer_height(d2) == 900, "load-seed: DB stays 900");
       idx_db_close(d2); unlink(q); }
+    // hostile start_height (No Good Deed): an old build persisted the raw
+    // handshake claim. A stored value above the validated tip + 2 is healed on
+    // load, for both 2^31-1 and 0xFFFFFFFF; tip+2 (honest announcement) is kept.
+    { const int64_t bad[2] = { 2147483647LL, 4294967295LL };
+      for (int i = 0; i < 2; i++) {
+        char q[256]; snprintf(q, sizeof q, "%s/ph_hostile%d.db", dir, i); unlink(q);
+        sqlite3 *d2 = idx_db_open(q); uint8_t tip[32] = {0};
+        idx_db_save_sync(d2, 1000, tip); idx_db_set_peer_height(d2, bad[i]);
+        CHECK(idx_db_get_peer_height(d2) == bad[i], "hostile: legacy claim stored by an old build");
+        idx_peer_height_reset(); idx_peer_height_load(d2);
+        CHECK(idx_db_get_peer_height(d2) == 1000, "hostile: load heals the stored claim to the validated tip");
+        CHECK(idx_peer_height_note(NULL, 0, 0, 0) == 1000, "hostile: in-memory best_known = validated tip");
+        CHECK(idx_peer_height_note(d2, 1001, 2000000, 1) == 1001 && idx_db_get_peer_height(d2) == 1001, "hostile: validated growth still raises");
+        idx_db_close(d2); unlink(q); }
+      char q[256]; snprintf(q, sizeof q, "%s/ph_keep.db", dir); unlink(q);
+      sqlite3 *d2 = idx_db_open(q); uint8_t tip[32] = {0};
+      idx_db_save_sync(d2, 1000, tip); idx_db_set_peer_height(d2, 1002);
+      idx_peer_height_reset(); idx_peer_height_load(d2);
+      CHECK(idx_db_get_peer_height(d2) == 1002, "hostile: tip+2 is within tolerance, kept");
+      idx_db_close(d2); unlink(q); }
     idx_db_close(db); idx_peer_height_reset();
     unlink(p);
 }

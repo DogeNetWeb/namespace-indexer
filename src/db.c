@@ -89,6 +89,12 @@ void idx_db_raise_peer_height(sqlite3 *db, int64_t h) {
 void idx_db_set_peer_height(sqlite3 *db, int64_t h) {
     idx_db_raise_peer_height(db, h);
 }
+// The ONE non-monotonic writer: idx_peer_height_load() healing a legacy
+// unchecked claim (stored > validated tip + 2) down to the validated tip.
+void idx_db_heal_peer_height(sqlite3 *db, int64_t h) {
+    char b[32]; snprintf(b, sizeof b, "%lld", (long long)(h > 0 ? h : 0));
+    meta_set(db, "peer_height", b);
+}
 int64_t idx_db_get_peer_height(sqlite3 *db) {
     char b[32]; return meta_get(db, "peer_height", b, sizeof b) ? strtoll(b, NULL, 10) : 0;
 }

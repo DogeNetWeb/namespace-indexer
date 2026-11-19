@@ -807,9 +807,25 @@ static int64_t g_ph_best = 0, g_ph_disk = 0, g_ph_at = 0;
 // Seed in-memory high-water from the DB so a post-restart note/handshake cannot
 // transiently set g_ph_disk below the stored value (raise alone keeps the DB safe;
 // load keeps the rate-limit cursor honest).
+// meta peer_height holds VALIDATED evidence only: our own connected blocks and
+// serve-plane announcements of blocks already on our chain (+1 for a block whose
+// parent is). Older builds persisted the raw handshake start_height; a stored
+// value above our validated tip + 2 is such a legacy claim and is healed on load.
 void idx_peer_height_load(sqlite3 *db) {
     int64_t h = db ? idx_db_get_peer_height(db) : 0;
     if (h <= 0) return;
+    { int64_t vh = 0; uint8_t vt[32];
+      if (idx_db_load_sync(db, &vh, vt) && h > vh + 2) {
+          fprintf(stderr, "peer_height: stored %lld is above the validated tip %lld (unchecked legacy claim) — healed\n",
+                  (long long)h, (long long)vh);
+          idx_db_heal_peer_height(db, vh);
+          h = vh;
+          pthread_mutex_lock(&g_ph_mu);
+          if (g_ph_best > h) g_ph_best = h;
+          if (g_ph_disk > h) g_ph_disk = h;
+          pthread_mutex_unlock(&g_ph_mu);
+          if (h <= 0) return;
+      } }
     pthread_mutex_lock(&g_ph_mu);
     if (h > g_ph_best) g_ph_best = h;
     if (h > g_ph_disk) g_ph_disk = h;
@@ -1435,10 +1451,10 @@ static int cmd_sync(int argc, char **argv) {
             fprintf(stderr, "  %s:%u handshake failed\n", host, port);
             close(fd); fd = -1; continue;
         }
-        if (idx_sync_peer_height > 0) {   // a handshake claim, never below announced evidence
-            int64_t ev = idx_peer_height_note(NULL, 0, 0, 0);
-            idx_db_raise_peer_height(db, idx_sync_peer_height > ev ? idx_sync_peer_height : ev);  // db-monotonic
-        }
+        // The handshake start_height is an unchecked claim: it stays this pass's
+        // live value (idx_sync_peer_height) and is NEVER persisted or folded into
+        // the best-known tip — one hostile peer advertising ~2^31 would otherwise
+        // pin it forever (No Good Deed review).
         net_peer_str(fd, picked, sizeof picked);
         idx_db_peer_seen(db, picked, (int64_t)idx_sync_peer_services,
                          (const char *)idx_sync_peer_agent, (int64_t)time(NULL));
@@ -1470,10 +1486,10 @@ static int cmd_sync(int argc, char **argv) {
         snprintf(picked, sizeof picked, "%s", fb_picked);
         idx_sync_peer_height = fb_h; idx_sync_peer_services = (uint64_t)fb_svc;
         snprintf((char *)idx_sync_peer_agent, sizeof idx_sync_peer_agent, "%s", fb_agent);
-        if (idx_sync_peer_height > 0) {   // a handshake claim, never below announced evidence
-            int64_t ev = idx_peer_height_note(NULL, 0, 0, 0);
-            idx_db_raise_peer_height(db, idx_sync_peer_height > ev ? idx_sync_peer_height : ev);  // db-monotonic
-        }
+        // The handshake start_height is an unchecked claim: it stays this pass's
+        // live value (idx_sync_peer_height) and is NEVER persisted or folded into
+        // the best-known tip — one hostile peer advertising ~2^31 would otherwise
+        // pin it forever (No Good Deed review).
         fprintf(stderr, "  no archive peer reachable — using limited peer %s\n", picked);
     }
     if (fb_fd >= 0) close(fb_fd);
@@ -1648,7 +1664,7 @@ static int cmd_sync(int argc, char **argv) {
         else idle++;
     }
     fprintf(stderr, "sync idle — caught up at height %lld\n", (long long)height);
-    idx_peer_height_note(db, idx_sync_peer_height, (int64_t)time(NULL), 1);   // flush the rate-limited write
+    idx_peer_height_note(db, height, (int64_t)time(NULL), 1);   // flush: validated tip only, never the claim
     if (idx_sync_peer_height > 0 && height >= idx_sync_peer_height)
         s_parity = time(NULL);          // hard parity, measured on a live socket
     idx_db_project(db, s);

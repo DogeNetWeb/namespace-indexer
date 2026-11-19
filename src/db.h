@@ -26,6 +26,7 @@ int  idx_db_load_sync(sqlite3 *db, int64_t *height, uint8_t tip_hash[32]);   // 
 void    idx_db_set_peer_height(sqlite3 *db, int64_t h);   // monotonic max (same as raise)
 void    idx_db_raise_peer_height(sqlite3 *db, int64_t h);   // monotonic max
 int64_t idx_db_get_peer_height(sqlite3 *db);
+void    idx_db_heal_peer_height(sqlite3 *db, int64_t h);  // load-time heal only (lowers)
 void idx_db_set_activation(sqlite3 *db, int64_t activation);
 int64_t idx_db_get_activation(sqlite3 *db, int64_t dflt);
 void    idx_db_set_subsidy(sqlite3 *db, int64_t subsidy_koinu);
