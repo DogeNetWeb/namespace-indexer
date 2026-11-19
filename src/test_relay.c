@@ -45,7 +45,7 @@ static size_t mkfan(uint8_t *b, const uint8_t prev[32]) {
 int main(void) {
     // feefilter payload parsing + policy
     uint8_t pl[8]; le(pl, 50000000, 8);
-    CK(feefilter_parse(pl, 8) == 50000000, "feefilter 50M koinu/kB parses (54.84.154.21's value)");
+    CK(feefilter_parse(pl, 8) == 50000000, "feefilter 50M koinu/kB parses (192.0.2.1's value)");
     CK(feefilter_parse(pl, 7) == -1, "short feefilter payload rejected");
     le(pl, 0x8000000000000000ull, 8);
     CK(feefilter_parse(pl, 8) == -1, "negative feefilter rejected");
