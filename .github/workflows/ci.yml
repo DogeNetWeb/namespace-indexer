@@ -1,0 +1,41 @@
+# CI for DogeNetWeb/namespace-indexer — build + unit/regression tests on x86_64 and arm64.
+# Free GitHub-hosted runners (public repo). No secrets, no deploy, no network
+# beyond cloning sibling public repos; tests bind loopback only.
+#
+# Skipped on purpose (documented, not hidden):
+#   - none: 'make check' here binds only ephemeral loopback ports (never
+#     15353/8443/8444/8445). t_webproxy (binds 8443/8444) lives in the tls repo.
+name: ci
+on:
+  push:
+    branches: [main, 'ci/**', 'keeper/**', 'fix/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: deps
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends libsqlite3-dev cmake
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: namespace-indexer
+          submodules: true
+          persist-credentials: false
+      - name: build
+        working-directory: namespace-indexer
+        run: make -j"$(nproc)" build/secp/lib/libsecp256k1.a && make -j"$(nproc)" indexerd
+      - name: test (make check)
+        working-directory: namespace-indexer
+        timeout-minutes: 15
+        run: make check
