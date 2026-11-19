@@ -35,7 +35,14 @@ jobs:
       - name: build
         working-directory: namespace-indexer
         run: make -j"$(nproc)" build/secp/lib/libsecp256k1.a && make -j"$(nproc)" indexerd
-      - name: test (make check)
+      - name: test (make check, in a private network namespace)
         working-directory: namespace-indexer
         timeout-minutes: 15
-        run: make check
+        # scripts/test_redial.py sniffs SYNs on lo with AF_PACKET, which needs
+        # CAP_NET_RAW: the suite is written to run under `unshare -rn`. Ubuntu
+        # 24.04 runners block unprivileged user namespaces via AppArmor, so lift
+        # that restriction for this ephemeral VM, then run the whole suite in a
+        # fresh user+net namespace (loopback only, nothing reaches the host net).
+        run: |
+          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          unshare -rn sh -c 'ip link set lo up && make check'
