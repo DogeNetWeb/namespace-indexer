@@ -677,6 +677,19 @@ static void sec_peer_height(const char *dir) {
       idx_peer_height_reset(); idx_peer_height_load(d2);
       CHECK(idx_db_get_peer_height(d2) == 1002, "hostile: tip+2 is within tolerance, kept");
       idx_db_close(d2); unlink(q); }
+    // version.start_height decode (Best In Show): uint32 LE must widen to
+    // int64 without wrapping through int32. 2^31 and 0xFFFFFFFF stay positive.
+    { uint8_t z[4] = {0,0,0,0}; CHECK(idx_ver_start_height(z, 4, 0) == 0, "parse: 0");
+      uint8_t one[4] = {1,0,0,0}; CHECK(idx_ver_start_height(one, 4, 0) == 1, "parse: 1");
+      uint8_t mid[4] = {0xff,0xff,0xff,0x7f};
+      CHECK(idx_ver_start_height(mid, 4, 0) == 2147483647LL, "parse: 2^31-1 stays positive");
+      uint8_t hi[4] = {0,0,0,0x80};
+      CHECK(idx_ver_start_height(hi, 4, 0) == 2147483648LL, "parse: 2^31 does not wrap to negative");
+      uint8_t max[4] = {0xff,0xff,0xff,0xff};
+      CHECK(idx_ver_start_height(max, 4, 0) == 4294967295LL, "parse: uint32 max does not wrap");
+      uint8_t shortp[3] = {0xff,0xff,0xff};
+      CHECK(idx_ver_start_height(shortp, 3, 0) == 0, "parse: truncated payload is 0");
+      CHECK(idx_ver_start_height(max, 4, 1) == 0, "parse: off truncated is 0"); }
     idx_db_close(db); idx_peer_height_reset();
     unlink(p);
 }

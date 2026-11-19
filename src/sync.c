@@ -34,6 +34,18 @@
 // (IDX_DNET_MARK, indexer.h — build-time per deployment, "/dogenet-" default)
 #define AGENT_MARKED(a) (!strncmp((a), IDX_DNET_MARK, sizeof IDX_DNET_MARK - 1))
 
+// version.start_height is a uint32 little-endian field. Read exactly 4 bytes,
+// clamp to the uint32 range by construction, and widen to int64 so a value of
+// 2^31 or 0xFFFFFFFF cannot wrap through a signed 32-bit cast (Best In Show).
+int64_t idx_ver_start_height(const uint8_t *pl, uint32_t pn, uint64_t off) {
+    if (!pl || off + 4 > (uint64_t)pn) return 0;
+    uint32_t u = (uint32_t)pl[off]
+               | ((uint32_t)pl[off + 1] << 8)
+               | ((uint32_t)pl[off + 2] << 16)
+               | ((uint32_t)pl[off + 3] << 24);
+    return (int64_t)u;   /* 0..4294967295, never negative */
+}
+
 // ── coin params (host-chain profile — see docs/notes/host-profiles.md) ────────
 // `start` = the pinned sync-bootstrap checkpoint: a fresh DB stands on this
 // (height, hash) and the first getblocks locator anchors there, so the peer serves
@@ -788,8 +800,7 @@ static int p2p_handshake(int fd, const uint8_t magic[4], int64_t our_height) {
                 memcpy((char *)idx_sync_peer_agent, pl + off, an);
                 ((char *)idx_sync_peer_agent)[an] = 0;   // peer subver — the crawl's classifier
                 off += ua;
-                int32_t ph = (int32_t)((uint32_t)pl[off] | ((uint32_t)pl[off+1] << 8) |
-                                       ((uint32_t)pl[off+2] << 16) | ((uint32_t)pl[off+3] << 24));
+                int64_t ph = idx_ver_start_height(pl, (uint32_t)pl_len, off);
                 if (ph > 0) idx_sync_peer_height = ph;
             }
         }
@@ -2130,8 +2141,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
               if (ua <= 100 && pln >= off + ua) { memcpy(c->agent, pl + off, ua); c->agent[ua] = 0; }
               if (ua <= 100 && pln >= off + ua + 4) {
                   uint64_t ho = off + ua;
-                  c->peer_h = (int64_t)((uint32_t)pl[ho] | ((uint32_t)pl[ho+1] << 8) |
-                                        ((uint32_t)pl[ho+2] << 16) | ((uint32_t)pl[ho+3] << 24));
+                  c->peer_h = idx_ver_start_height(pl, pln, ho);
               } } }
         if (!c->sent_ver) {
             int64_t h = 0; uint8_t tip[32]; idx_db_load_sync(db, &h, tip);
@@ -2381,8 +2391,7 @@ static int serve_dial(const char *host, uint16_t port, const Coin *coin,
                 if (ua <= 100 && pn >= off + ua) { memcpy(agent_out, pl + off, ua); agent_out[ua] = 0; }
                 if (ua <= 100 && height_out && pn >= off + ua + 4) {   // claimed start_height (tail)
                     uint64_t ho = off + ua;
-                    *height_out = (int64_t)((uint32_t)pl[ho] | ((uint32_t)pl[ho+1] << 8) |
-                                            ((uint32_t)pl[ho+2] << 16) | ((uint32_t)pl[ho+3] << 24));
+                    *height_out = idx_ver_start_height(pl, pn, ho);
                 } }
             net_send(fd, coin->magic, "verack", NULL, 0);
         } else if (!strcmp(cmd, "verack")) gvk = 1;

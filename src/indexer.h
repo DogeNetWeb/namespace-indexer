@@ -47,6 +47,11 @@ extern volatile int idx_sync_stop;
 // signal — a caught-up getblocks is answered with silence — so embedding
 // hosts use it to render truthful sync state. The headless CLI just logs it.
 extern volatile int64_t idx_sync_peer_height;
+// version.start_height is uint32 LE on the wire. Decode and widen to int64
+// without a signed 32-bit intermediate, so a value of 2^31 or above cannot
+// wrap to a negative height. The result is always in 0..UINT32_MAX; 0 if
+// the payload is truncated. (Best In Show, Nov 18.)
+int64_t idx_ver_start_height(const uint8_t *pl, uint32_t pn, uint64_t off);
 // peer_height follows block announcements (inv / headers / pushed blocks we
 // can place on our chain, and blocks folded from the sync peer), not only the
 // handshake's start_height. Monotonic; the meta write is rate-limited to one
